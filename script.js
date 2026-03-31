@@ -199,9 +199,6 @@ function drawScene() {
             const avgEAR = (calculateEAR([33, 160, 158, 133, 153, 144], face) + calculateEAR([362, 385, 387, 263, 373, 380], face)) / 2.0;
             if (avgEAR < EAR_THRESHOLD) { eyeClosedFrames++; isSleeping = eyeClosedFrames >= CLOSED_FRAMES_THRESHOLD; faceStatus = isSleeping ? "BUỒN NGỦ!" : "Đang nhắm mắt..."; }
             else { eyeClosedFrames = 0; faceStatus = "Tỉnh táo"; isSleeping = false; }
-            [33, 133, 160, 158, 153, 144, 362, 263, 385, 387, 373, 380].forEach(idx => {
-                const pt = mapPoint(face[idx], rect); ctx.fillStyle = isSleeping ? "red" : "#00ffcc"; ctx.beginPath(); ctx.arc(pt.x, pt.y, 3, 0, 2 * Math.PI); ctx.fill();
-            });
         }
 
         if (isSleeping) { if (!alarmInterval) { playBeep(); alarmInterval = setInterval(playBeep, 400); } }
