@@ -25,8 +25,15 @@ let lastHandY = 0;
 
 // Config cảnh báo buồn ngủ
 let eyeClosedFrames = 0;
-const EAR_THRESHOLD = 0.22; 
-const CLOSED_FRAMES_THRESHOLD = 15; 
+const EAR_MIN_THRESHOLD = 0.14;
+const EAR_MAX_THRESHOLD = 0.22;
+const EAR_RATIO_FROM_BASELINE = 0.72;
+const CLOSED_FRAMES_THRESHOLD = 15;
+const EAR_CALIBRATION_FRAMES = 20;
+let earBaseline = null;
+let smoothedEAR = null;
+let earStableFrames = 0;
+let dynamicEarThreshold = EAR_MAX_THRESHOLD;
 let faceStatus = "Tỉnh táo";
 let isSleeping = false;
 
@@ -220,9 +227,33 @@ function drawScene() {
             const oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10];
             for(let i=0; i < oval.length; i++) { const pt = mapPoint(face[oval[i]], rect); if(i===0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y); }
             ctx.stroke();
-            const avgEAR = (calculateEAR([33, 160, 158, 133, 153, 144], face) + calculateEAR([362, 385, 387, 263, 373, 380], face)) / 2.0;
-            if (avgEAR < EAR_THRESHOLD) { eyeClosedFrames++; isSleeping = eyeClosedFrames >= CLOSED_FRAMES_THRESHOLD; faceStatus = isSleeping ? "BUỒN NGỦ!" : "Đang nhắm mắt..."; }
-            else { eyeClosedFrames = 0; faceStatus = "Tỉnh táo"; isSleeping = false; }
+            const avgEARRaw = (calculateEAR([33, 160, 158, 133, 153, 144], face) + calculateEAR([362, 385, 387, 263, 373, 380], face)) / 2.0;
+            if (Number.isFinite(avgEARRaw) && avgEARRaw > 0) {
+                smoothedEAR = smoothedEAR === null ? avgEARRaw : (smoothedEAR * 0.75 + avgEARRaw * 0.25);
+                if (earBaseline === null) {
+                    earBaseline = smoothedEAR;
+                } else {
+                    const alpha = smoothedEAR > earBaseline ? 0.08 : 0.01;
+                    earBaseline = earBaseline * (1 - alpha) + smoothedEAR * alpha;
+                }
+                dynamicEarThreshold = clamp(earBaseline * EAR_RATIO_FROM_BASELINE, EAR_MIN_THRESHOLD, EAR_MAX_THRESHOLD);
+                earStableFrames++;
+                const isCalibrated = earStableFrames >= EAR_CALIBRATION_FRAMES;
+
+                if (isCalibrated && smoothedEAR < dynamicEarThreshold) {
+                    eyeClosedFrames++;
+                    isSleeping = eyeClosedFrames >= CLOSED_FRAMES_THRESHOLD;
+                    faceStatus = isSleeping ? "BUỒN NGỦ!" : "Đang nhắm mắt...";
+                } else {
+                    eyeClosedFrames = 0;
+                    isSleeping = false;
+                    faceStatus = isCalibrated ? "Tỉnh táo" : "Đang hiệu chỉnh mắt...";
+                }
+            } else {
+                eyeClosedFrames = 0;
+                isSleeping = false;
+                faceStatus = "Đang theo dõi mắt...";
+            }
         }
 
         if (isSleeping) { if (!alarmInterval) { playBeep(); alarmInterval = setInterval(playBeep, 400); } }
