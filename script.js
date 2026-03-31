@@ -25,11 +25,11 @@ let lastPinchHitTestAt = 0;
 let lastInfoUpdateAt = 0;
 
 const PERF = {
-    detectIntervalMs: isMobile ? 66 : 33,
+    detectIntervalMs: isMobile ? 60 : 28,
     maxBoxes: isMobile ? 28 : 96,
     handModelComplexity: isMobile ? 0 : 1,
     faceRefineLandmarks: !isMobile,
-    pinchHitTestMs: isMobile ? 90 : 45,
+    pinchHitTestMs: isMobile ? 75 : 32,
     infoRefreshMs: 120,
     handHoldMs: 140,
     faceHoldMs: 140
@@ -74,16 +74,30 @@ const BOX_ADD_COOLDOWN_MS = 120;
 let wasZeroFingers = false;
 let lastHandX = 0;
 let lastHandY = 0; 
+let rightActionCandidate = null;
+let rightActionStableFrames = 0;
+let rightActionStable = null;
+let pinchActive = false;
 let leftFingerCandidate = null;
 let leftFingerStableFrames = 0;
 let leftFingerStable = null;
+let leftGestureCandidate = null;
+let leftGestureStableFrames = 0;
+let leftGestureStable = null;
+let leftGestureLastSeenAt = 0;
 let lastLeftClearAt = 0;
-const LEFT_ACTION_STABLE_FRAMES = 3;
+const LEFT_ACTION_STABLE_FRAMES = 2;
 const LEFT_CLEAR_COOLDOWN_MS = 500;
-const FINGER_UP_TOLERANCE = 0.02;
-const THUMB_UP_THRESHOLD = 0.02;
-const PINCH_DISTANCE_THRESHOLD = 0.065;
-const OK_GESTURE_DISTANCE_THRESHOLD = 0.07;
+const RIGHT_ACTION_STABLE_FRAMES = 2;
+const GESTURE_STABLE_FRAMES = 2;
+const GESTURE_HOLD_MS = 260;
+const FINGER_UP_TOLERANCE = 0.035;
+const THUMB_UP_THRESHOLD = 0.015;
+const PINCH_DISTANCE_THRESHOLD = 0.082;
+const PINCH_RELEASE_DISTANCE_THRESHOLD = 0.102;
+const OK_GESTURE_DISTANCE_THRESHOLD = 0.082;
+const ROTATE_DEADZONE = 0.0022;
+const ROTATION_SENSITIVITY = 5;
 
 // Config cảnh báo buồn ngủ
 const EAR_MIN_THRESHOLD = 0.14;
@@ -197,6 +211,14 @@ function updateSmoothedHands(handLandmarks) {
             leftFingerCandidate = null;
             leftFingerStableFrames = 0;
             leftFingerStable = null;
+            leftGestureCandidate = null;
+            leftGestureStableFrames = 0;
+            leftGestureStable = null;
+            leftGestureLastSeenAt = 0;
+            rightActionCandidate = null;
+            rightActionStableFrames = 0;
+            rightActionStable = null;
+            pinchActive = false;
             wasZeroFingers = false;
         }
         return;
@@ -206,9 +228,29 @@ function updateSmoothedHands(handLandmarks) {
         smoothedHands = handLandmarks.map(hand => hand.map(pt => ({...pt})));
         return;
     }
+
+    const previousHands = smoothedHands;
+    const usedPrevious = new Set();
+    const previousByCurrent = handLandmarks.map(hand => {
+        let bestIndex = -1;
+        let bestDist = Infinity;
+        for (let i = 0; i < previousHands.length; i++) {
+            if (usedPrevious.has(i)) continue;
+            const prevWrist = previousHands[i][0];
+            const currWrist = hand[0];
+            const dist = Math.hypot(prevWrist.x - currWrist.x, prevWrist.y - currWrist.y);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestIndex = i;
+            }
+        }
+        if (bestIndex >= 0) usedPrevious.add(bestIndex);
+        return bestIndex >= 0 ? previousHands[bestIndex] : null;
+    });
+
     smoothedHands = handLandmarks.map((hand, handIndex) => {
-        const previousHand = smoothedHands[handIndex];
-        return hand.map((point, pointIndex) => smoothPoint(previousHand[pointIndex], point, 0.6));
+        const previousHand = previousByCurrent[handIndex];
+        return hand.map((point, pointIndex) => smoothPoint(previousHand?.[pointIndex], point, 0.52));
     });
 }
 
@@ -225,6 +267,16 @@ function countRaisedFingers(hand) {
     return count;
 }
 
+function updateStableValue(rawValue, candidate, stableFrames, stableValue, requiredFrames) {
+    if (rawValue === candidate) stableFrames++;
+    else {
+        candidate = rawValue;
+        stableFrames = 1;
+    }
+    if (stableFrames >= requiredFrames) stableValue = candidate;
+    return { candidate, stableFrames, stableValue };
+}
+
 function detectGesture(hand) {
     const middle = isFingerUp(hand, 12, 10);
     const ring = isFingerUp(hand, 16, 14);
@@ -235,6 +287,24 @@ function detectGesture(hand) {
     if (count === 2) return "HI 👋";
     if (count === 4) return "HELP 🆘";
     return null;
+}
+
+function commitRotationToBoxes(cx, cy) {
+    boxes3D.forEach(b => {
+        let vx = b.gridX - cx;
+        let vy = b.gridY - cy;
+        let vz = b.z || 0;
+        let tx = vx * Math.cos(rotationAngle) - vz * Math.sin(rotationAngle);
+        let tz = vx * Math.sin(rotationAngle) + vz * Math.cos(rotationAngle);
+        vx = tx;
+        vz = tz;
+        let ty = vy * Math.cos(rotationAngleY) - vz * Math.sin(rotationAngleY);
+        vz = vy * Math.sin(rotationAngleY) + vz * Math.cos(rotationAngleY);
+        vy = ty;
+        b.gridX = vx + cx;
+        b.gridY = vy + cy;
+        b.z = vz;
+    });
 }
 
 function getDistance(p1, p2) { return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2)); }
@@ -299,8 +369,8 @@ const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediap
 hands.setOptions({
     maxNumHands: 2,
     modelComplexity: PERF.handModelComplexity,
-    minDetectionConfidence: 0.5,
-    minTrackingConfidence: 0.5,
+    minDetectionConfidence: 0.45,
+    minTrackingConfidence: 0.45,
     selfieMode: true
 });
 hands.onResults(res => { 
@@ -491,29 +561,65 @@ function drawScene() {
                     if (leftFingerStable === 1) lightOn = true;
                     else if (leftFingerStable === 0) lightOn = false;
                     const gst = detectGesture(hand);
-                    if (gst) { ctx.fillStyle = "#FFD700"; ctx.font = `bold ${gestureFont}px sans-serif`; ctx.fillText(gst, wrist.x + labelOffsetX, wrist.y - Math.round(40 * uiScale)); }
+                    const leftGestureState = updateStableValue(
+                        gst,
+                        leftGestureCandidate,
+                        leftGestureStableFrames,
+                        leftGestureStable,
+                        GESTURE_STABLE_FRAMES
+                    );
+                    leftGestureCandidate = leftGestureState.candidate;
+                    leftGestureStableFrames = leftGestureState.stableFrames;
+                    leftGestureStable = leftGestureState.stableValue;
+                    if (leftGestureStable) leftGestureLastSeenAt = now;
+                    if (leftGestureStable && (now - leftGestureLastSeenAt) <= GESTURE_HOLD_MS) {
+                        ctx.fillStyle = "#FFD700";
+                        ctx.font = `bold ${gestureFont}px sans-serif`;
+                        ctx.fillText(leftGestureStable, wrist.x + labelOffsetX, wrist.y - Math.round(40 * uiScale));
+                    }
                 }
 
                 if (label === "Right") {
-                    if (fingersUp === 0) {
-                        if (wasZeroFingers) { rotationAngle += (hand[0].x - lastHandX) * 4; rotationAngleY += (hand[0].y - lastHandY) * 4; }
-                        lastHandX = hand[0].x; lastHandY = hand[0].y; wasZeroFingers = true;
-                    } else if (wasZeroFingers) {
-                        boxes3D.forEach(b => {
-                            let vx = b.gridX - cx, vy = b.gridY - cy, vz = b.z || 0;
-                            let tx = vx * Math.cos(rotationAngle) - vz * Math.sin(rotationAngle);
-                            let tz = vx * Math.sin(rotationAngle) + vz * Math.cos(rotationAngle);
-                            vx = tx; vz = tz;
-                            let ty = vy * Math.cos(rotationAngleY) - vz * Math.sin(rotationAngleY);
-                            vz = vy * Math.sin(rotationAngleY) + vz * Math.cos(rotationAngleY);
-                            vy = ty;
-                            b.gridX = vx + cx; b.gridY = vy + cy; b.z = vz;
-                        });
-                        rotationAngle = 0; rotationAngleY = 0; wasZeroFingers = false;
+                    const distPinch = Math.hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y);
+                    const rawRightAction = distPinch < PINCH_DISTANCE_THRESHOLD ? "pinch" : (fingersUp === 0 ? "rotate" : null);
+                    const rightActionState = updateStableValue(
+                        rawRightAction,
+                        rightActionCandidate,
+                        rightActionStableFrames,
+                        rightActionStable,
+                        RIGHT_ACTION_STABLE_FRAMES
+                    );
+                    rightActionCandidate = rightActionState.candidate;
+                    rightActionStableFrames = rightActionState.stableFrames;
+                    rightActionStable = rightActionState.stableValue;
+
+                    if (rightActionStable !== "rotate" && wasZeroFingers) {
+                        commitRotationToBoxes(cx, cy);
+                        rotationAngle = 0;
+                        rotationAngleY = 0;
+                        wasZeroFingers = false;
                     }
 
-                    const distPinch = Math.hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y);
-                    if (distPinch < PINCH_DISTANCE_THRESHOLD && performance.now() - lastPinchHitTestAt >= PERF.pinchHitTestMs) {
+                    if (rightActionStable === "rotate") {
+                        const dx = hand[0].x - lastHandX;
+                        const dy = hand[0].y - lastHandY;
+                        if (wasZeroFingers) {
+                            if (Math.abs(dx) > ROTATE_DEADZONE) rotationAngle += dx * ROTATION_SENSITIVITY;
+                            if (Math.abs(dy) > ROTATE_DEADZONE) rotationAngleY += dy * ROTATION_SENSITIVITY;
+                        }
+                        lastHandX = hand[0].x;
+                        lastHandY = hand[0].y;
+                        wasZeroFingers = true;
+                    }
+
+                    if (rightActionStable !== "pinch" && distPinch > PINCH_RELEASE_DISTANCE_THRESHOLD) {
+                        pinchActive = false;
+                    } else if (rightActionStable === "pinch") {
+                        if (!pinchActive && distPinch < PINCH_DISTANCE_THRESHOLD) pinchActive = true;
+                        if (pinchActive && distPinch > PINCH_RELEASE_DISTANCE_THRESHOLD) pinchActive = false;
+                    }
+
+                    if (pinchActive && performance.now() - lastPinchHitTestAt >= PERF.pinchHitTestMs) {
                         lastPinchHitTestAt = performance.now();
                         const mx = (mappedPoints[4].x + mappedPoints[8].x) / 2, my = (mappedPoints[4].y + mappedPoints[8].y) / 2;
                         let hit = null;
@@ -617,12 +723,11 @@ async function detectLoop() {
         lastDetectAt = now;
         try {
             if (isMobile) {
-                if (detectPhase === 0) await hands.send({ image: video });
-                else await faceMesh.send({ image: video });
-                detectPhase = (detectPhase + 1) % 2;
+                await hands.send({ image: video });
             } else {
                 await hands.send({ image: video });
-                await faceMesh.send({ image: video });
+                if (detectPhase === 0) await faceMesh.send({ image: video });
+                detectPhase = (detectPhase + 1) % 2;
             }
         }
         catch(e) { console.error(e); }
