@@ -3,6 +3,7 @@ const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 const info = document.getElementById("info");
 const audioBtn = document.getElementById("start-audio-btn");
+const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
 
 let lastTime = performance.now();
 let renderFps = 0;
@@ -60,11 +61,24 @@ const HAND_CONNECTIONS = [
 ];
 
 function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    const viewportWidth = Math.round(window.visualViewport?.width || window.innerWidth);
+    const viewportHeight = Math.round(window.visualViewport?.height || window.innerHeight);
+    canvas.width = viewportWidth;
+    canvas.height = viewportHeight;
+    canvas.style.width = `${viewportWidth}px`;
+    canvas.style.height = `${viewportHeight}px`;
 }
 window.addEventListener("resize", resize);
+window.visualViewport?.addEventListener("resize", resize);
 resize();
+
+function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+}
+
+function getUiScale() {
+    return clamp(canvas.width / 1280, 0.75, 1);
+}
 
 function getDrawRect() {
     const vw = video.videoWidth || 640;
@@ -166,7 +180,10 @@ function solveInverseBilinearInterpolation(p0, p1, p2, p3, p, maxIterations = 20
 
 async function startCamera() {
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        const videoConstraints = isMobile
+            ? { facingMode: { ideal: "user" }, width: { ideal: 960, max: 1280 }, height: { ideal: 540, max: 720 } }
+            : { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } };
+        const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
         video.srcObject = stream; await video.play(); drawScene(); detectLoop();
     } catch (err) { info.innerText = "Không mở được camera: " + err.message; }
 }
@@ -185,6 +202,14 @@ faceMesh.onResults(res => { latestFaceResult = res; });
 function drawScene() {
     if (video.readyState >= 2) {
         const rect = getDrawRect();
+        const uiScale = getUiScale();
+        const baseLabelFont = Math.round(16 * uiScale);
+        const gestureFont = Math.round(26 * uiScale);
+        const statusFont = Math.round(26 * uiScale);
+        const handLineWidth = clamp(5 * uiScale, 3, 5);
+        const pointRadius = clamp(5 * uiScale, 3, 5);
+        const strokeThin = clamp(1.5 * uiScale, 1.1, 1.5);
+        const safeMargin = Math.round(clamp(canvas.width * 0.02, 12, 24));
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.save(); ctx.translate(rect.offsetX + rect.drawWidth, rect.offsetY); ctx.scale(-1, 1);
         ctx.drawImage(video, 0, 0, rect.drawWidth, rect.drawHeight); ctx.restore();
@@ -192,7 +217,7 @@ function drawScene() {
         let faceFound = false;
         if (latestFaceResult?.multiFaceLandmarks?.length > 0) {
             faceFound = true; const face = latestFaceResult.multiFaceLandmarks[0];
-            ctx.strokeStyle = "#00bfff"; ctx.lineWidth = 1.5; ctx.beginPath();
+            ctx.strokeStyle = "#00bfff"; ctx.lineWidth = strokeThin; ctx.beginPath();
             const oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10];
             for(let i=0; i < oval.length; i++) { const pt = mapPoint(face[oval[i]], rect); if(i===0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y); }
             ctx.stroke();
@@ -239,15 +264,17 @@ function drawScene() {
                 const fingersUp = countRaisedFingers(hand);
                 const mappedPoints = hand.map(pt => mapPoint(pt, rect));
                 const wrist = mappedPoints[0];
+                const labelOffsetX = Math.round(15 * uiScale);
+                const labelOffsetY = Math.round(15 * uiScale);
 
-                ctx.fillStyle = "#ffffff"; ctx.font = "bold 16px sans-serif";
-                ctx.fillText(`Tay ${handIdx + 1} (${label}) | ${fingersUp} ngón`, wrist.x + 15, wrist.y - 15);
+                ctx.fillStyle = "#ffffff"; ctx.font = `bold ${baseLabelFont}px sans-serif`;
+                ctx.fillText(`Tay ${handIdx + 1} (${label}) | ${fingersUp} ngón`, wrist.x + labelOffsetX, wrist.y - labelOffsetY);
 
                 if (label === "Left") {
                     if (fingersUp === 5) boxes3D = [];
                     if (fingersUp === 1) lightOn = true; else if (fingersUp === 0) lightOn = false;
                     const gst = detectGesture(hand);
-                    if (gst) { ctx.fillStyle = "#FFD700"; ctx.font = "bold 26px sans-serif"; ctx.fillText(gst, wrist.x + 15, wrist.y - 40); }
+                    if (gst) { ctx.fillStyle = "#FFD700"; ctx.font = `bold ${gestureFont}px sans-serif`; ctx.fillText(gst, wrist.x + labelOffsetX, wrist.y - Math.round(40 * uiScale)); }
                 }
 
                 if (label === "Right") {
@@ -284,10 +311,10 @@ function drawScene() {
                     }
                 }
 
-                ctx.strokeStyle = "rgba(0, 255, 250, 0.8)"; ctx.lineWidth = 5; ctx.lineCap = "round"; ctx.beginPath();
+                ctx.strokeStyle = "rgba(0, 255, 250, 0.8)"; ctx.lineWidth = handLineWidth; ctx.lineCap = "round"; ctx.beginPath();
                 HAND_CONNECTIONS.forEach(([s, e]) => { ctx.moveTo(mappedPoints[s].x, mappedPoints[s].y); ctx.lineTo(mappedPoints[e].x, mappedPoints[e].y); });
                 ctx.stroke();
-                ctx.fillStyle = "#FFD700"; mappedPoints.forEach(pt => { ctx.beginPath(); ctx.arc(pt.x, pt.y, 5, 0, 2 * Math.PI); ctx.fill(); });
+                ctx.fillStyle = "#FFD700"; mappedPoints.forEach(pt => { ctx.beginPath(); ctx.arc(pt.x, pt.y, pointRadius, 0, 2 * Math.PI); ctx.fill(); });
             });
         }
 
@@ -295,24 +322,33 @@ function drawScene() {
         if (facesToDraw.length > 0) {
             facesToDraw.sort((a, b) => a.z - b.z);
             facesToDraw.forEach(f => {
-                ctx.fillStyle = f.color; ctx.strokeStyle = "rgba(255, 255, 255, 0.8)"; ctx.lineWidth = 1.5; ctx.beginPath();
+                ctx.fillStyle = f.color; ctx.strokeStyle = "rgba(255, 255, 255, 0.8)"; ctx.lineWidth = strokeThin; ctx.beginPath();
                 ctx.moveTo(f.pts[0].x, f.pts[0].y); ctx.lineTo(f.pts[1].x, f.pts[1].y); ctx.lineTo(f.pts[2].x, f.pts[2].y); ctx.lineTo(f.pts[3].x, f.pts[3].y); ctx.closePath();
                 ctx.fill(); ctx.stroke();
             });
         }
 
         if (lightOn) {
-            const glow = ctx.createRadialGradient(cx, cy, 40, cx, cy, Math.max(canvas.width, canvas.height)/1.3);
+            const glow = ctx.createRadialGradient(cx, cy, Math.round(clamp(40 * uiScale, 24, 40)), cx, cy, Math.max(canvas.width, canvas.height)/1.3);
             glow.addColorStop(0, "rgba(211,255,180,0.3)"); glow.addColorStop(1, "rgba(255,220,80,0)");
             ctx.fillStyle = glow; ctx.fillRect(0, 0, canvas.width, canvas.height);
         }
 
-        ctx.fillStyle = isSleeping ? "#ff3333" : (faceFound ? "#00ffcc" : "#aaaaaa"); ctx.font = "bold 26px sans-serif";
-        ctx.fillText(`Trạng thái: ${faceStatus}`, 20, 50);
+        ctx.fillStyle = isSleeping ? "#ff3333" : (faceFound ? "#00ffcc" : "#aaaaaa"); ctx.font = `bold ${statusFont}px sans-serif`;
+        ctx.fillText(`Trạng thái: ${faceStatus}`, safeMargin, safeMargin + statusFont);
         if (isSleeping) {
             ctx.fillStyle = "rgba(255, 0, 0, 0.35)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.fillStyle = "#ffffff"; ctx.font = "bold 55px sans-serif"; ctx.textAlign = "center";
-            ctx.fillText("⚠️ CẢNH BÁO BUỒN NGỦ ⚠️", cx, cy); ctx.textAlign = "left";
+            ctx.fillStyle = "#ffffff";
+            let warningFont = Math.round(clamp(canvas.width * 0.08, 24, 55));
+            let warningText = "⚠️ CẢNH BÁO BUỒN NGỦ ⚠️";
+            ctx.font = `bold ${warningFont}px sans-serif`;
+            while (ctx.measureText(warningText).width > canvas.width - safeMargin * 2 && warningFont > 18) {
+                warningFont -= 2;
+                ctx.font = `bold ${warningFont}px sans-serif`;
+            }
+            ctx.textAlign = "center";
+            ctx.fillText(warningText, cx, cy);
+            ctx.textAlign = "left";
         }
         const now = performance.now(); renderFps = 1000 / (now - lastTime); lastTime = now;     
         info.innerText = `FPS: ${renderFps.toFixed(1)} | Tay: ${smoothedHands.length} | Mặt: ${faceStatus}`;
