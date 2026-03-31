@@ -1,0 +1,50 @@
+body { 
+    margin:0; 
+    overflow:hidden; 
+    background:black; 
+    font-family: sans-serif; 
+}
+
+video, canvas {
+    position:absolute;
+    top:0; 
+    left:0;
+}
+
+#info {
+    position:absolute;
+    bottom:15px; 
+    left:15px;
+    z-index:10;
+    color:#00ffcc;
+    font:15px monospace;
+    background:rgba(0, 20, 40, 0.6);
+    padding:10px 15px;
+    border-radius:10px;
+    border: 1px solid #00ffcc;
+    box-shadow: 0 0 10px rgba(0, 255, 204, 0.3);
+}
+
+#start-audio-btn {
+    position: absolute;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    background: #ff3333;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    font-size: 16px;
+    font-weight: bold;
+    border-radius: 8px;
+    cursor: pointer;
+    box-shadow: 0 0 15px rgba(255, 51, 51, 0.5);
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0% { transform: translateX(-50%) scale(1); }
+    50% { transform: translateX(-50%) scale(1.05); }
+    100% { transform: translateX(-50%) scale(1); }
+}
