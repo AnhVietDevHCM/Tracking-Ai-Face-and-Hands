@@ -1,6 +1,6 @@
 const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
-const ctx = canvas.getContext("2d");
+const ctx = canvas.getContext("2d", { alpha: false });
 const info = document.getElementById("info");
 const audioBtn = document.getElementById("start-audio-btn");
 const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
@@ -11,7 +11,58 @@ let detectBusy = false;
 let latestHandResult = null;
 let latestFaceResult = null;
 let smoothedHands = [];
+let stableHandedness = [];
+let handsMissingSince = null;
+let lastFaceLandmarks = null;
+let lastFaceSeenAt = 0;
 let lightOn = false;
+let cachedGlowGradient = null;
+let cachedGlowWidth = 0;
+let cachedGlowHeight = 0;
+let lastDetectAt = 0;
+let detectPhase = 0;
+let lastPinchHitTestAt = 0;
+let lastInfoUpdateAt = 0;
+
+const PERF = {
+    detectIntervalMs: isMobile ? 66 : 33,
+    maxBoxes: isMobile ? 28 : 96,
+    handModelComplexity: isMobile ? 0 : 1,
+    faceRefineLandmarks: !isMobile,
+    pinchHitTestMs: isMobile ? 90 : 45,
+    infoRefreshMs: 120,
+    handHoldMs: 140,
+    faceHoldMs: 140
+};
+
+const BOX_VERTICES = [
+    { x: -1, y: -1, z: -1 },
+    { x: 1, y: -1, z: -1 },
+    { x: 1, y: 1, z: -1 },
+    { x: -1, y: 1, z: -1 },
+    { x: -1, y: -1, z: 1 },
+    { x: 1, y: -1, z: 1 },
+    { x: 1, y: 1, z: 1 },
+    { x: -1, y: 1, z: 1 }
+];
+
+const BOX_FACES = [
+    { i: [0, 1, 2, 3], c: "#1976D2" },
+    { i: [4, 5, 6, 7], c: "#42A5F5" },
+    { i: [0, 1, 5, 4], c: "#90CAF9" },
+    { i: [2, 3, 7, 6], c: "#0D47A1" },
+    { i: [0, 3, 7, 4], c: "#1E88E5" },
+    { i: [1, 2, 6, 5], c: "#1565C0" }
+];
+
+const FACE_NORMALS = [
+    { x: 0, y: 0, z: -1 },
+    { x: 0, y: 0, z: 1 },
+    { x: 0, y: -1, z: 0 },
+    { x: 0, y: 1, z: 0 },
+    { x: -1, y: 0, z: 0 },
+    { x: 1, y: 0, z: 0 }
+];
 
 // State cho khối 3D
 let boxes3D = [];
@@ -19,21 +70,34 @@ let rotationAngle = 0;
 let rotationAngleY = 0; 
 let lastBoxTime = 0;
 const BOX_SIZE = 40;
+const BOX_ADD_COOLDOWN_MS = 120;
 let wasZeroFingers = false;
 let lastHandX = 0;
 let lastHandY = 0; 
+let leftFingerCandidate = null;
+let leftFingerStableFrames = 0;
+let leftFingerStable = null;
+let lastLeftClearAt = 0;
+const LEFT_ACTION_STABLE_FRAMES = 3;
+const LEFT_CLEAR_COOLDOWN_MS = 500;
+const FINGER_UP_TOLERANCE = 0.02;
+const THUMB_UP_THRESHOLD = 0.02;
+const PINCH_DISTANCE_THRESHOLD = 0.065;
+const OK_GESTURE_DISTANCE_THRESHOLD = 0.07;
 
 // Config cảnh báo buồn ngủ
 const EAR_MIN_THRESHOLD = 0.14;
 const EAR_MAX_THRESHOLD = 0.22;
 const EAR_RATIO_FROM_BASELINE = 0.72;
 const CLOSED_DURATION_MS_THRESHOLD = 3000;
+const EYE_OPEN_CONFIRM_MS = 450;
 const EAR_CALIBRATION_FRAMES = 20;
 let earBaseline = null;
 let smoothedEAR = null;
 let earStableFrames = 0;
 let dynamicEarThreshold = EAR_MAX_THRESHOLD;
 let eyeClosedSince = null;
+let eyeOpenSince = null;
 let faceStatus = "Tỉnh táo";
 let isSleeping = false;
 
@@ -60,26 +124,40 @@ function playBeep() {
     osc.stop(audioCtx.currentTime + 0.3);
 }
 
-const HAND_CONNECTIONS = [
-    [0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8],
-    [5, 9], [9, 10], [10, 11], [11, 12], [9, 13], [13, 14], [14, 15], [15, 16],
-    [13, 17], [0, 17], [17, 18], [18, 19], [19, 20]
-];
-
 function resize() {
     const viewportWidth = Math.round(window.visualViewport?.width || window.innerWidth);
     const viewportHeight = Math.round(window.visualViewport?.height || window.innerHeight);
+    if (canvas.width === viewportWidth && canvas.height === viewportHeight) return;
     canvas.width = viewportWidth;
     canvas.height = viewportHeight;
     canvas.style.width = `${viewportWidth}px`;
     canvas.style.height = `${viewportHeight}px`;
+    cachedGlowGradient = null;
+    cachedGlowWidth = 0;
+    cachedGlowHeight = 0;
 }
 window.addEventListener("resize", resize);
-window.visualViewport?.addEventListener("resize", resize);
+if (isMobile) window.visualViewport?.addEventListener("resize", resize);
 resize();
 
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
+}
+
+function hasBoxAt(x, y, z, tolerance = BOX_SIZE * 0.28) {
+    return boxes3D.some(b =>
+        Math.abs(b.gridX - x) <= tolerance &&
+        Math.abs(b.gridY - y) <= tolerance &&
+        Math.abs((b.z || 0) - z) <= tolerance
+    );
+}
+
+function addBoxAt(x, y, z) {
+    if (hasBoxAt(x, y, z)) return false;
+    boxes3D.push({ gridX: x, gridY: y, z });
+    if (boxes3D.length > PERF.maxBoxes) boxes3D.shift();
+    lastBoxTime = performance.now();
+    return true;
 }
 
 function getUiScale() {
@@ -112,9 +190,18 @@ function smoothPoint(prev, next, alpha = 0.6) {
 
 function updateSmoothedHands(handLandmarks) {
     if (!handLandmarks || handLandmarks.length === 0) {
-        smoothedHands = [];
+        if (handsMissingSince === null) handsMissingSince = performance.now();
+        if (performance.now() - handsMissingSince > PERF.handHoldMs) {
+            smoothedHands = [];
+            stableHandedness = [];
+            leftFingerCandidate = null;
+            leftFingerStableFrames = 0;
+            leftFingerStable = null;
+            wasZeroFingers = false;
+        }
         return;
     }
+    handsMissingSince = null;
     if (smoothedHands.length !== handLandmarks.length) {
         smoothedHands = handLandmarks.map(hand => hand.map(pt => ({...pt})));
         return;
@@ -125,8 +212,8 @@ function updateSmoothedHands(handLandmarks) {
     });
 }
 
-function isFingerUp(hand, tipIndex, pipIndex) { return hand[tipIndex].y < hand[pipIndex].y; }
-function isThumbUp(hand) { return Math.abs(hand[4].x - hand[3].x) > 0.03; }
+function isFingerUp(hand, tipIndex, pipIndex) { return hand[tipIndex].y < (hand[pipIndex].y + FINGER_UP_TOLERANCE); }
+function isThumbUp(hand) { return Math.abs(hand[4].x - hand[3].x) > THUMB_UP_THRESHOLD; }
 
 function countRaisedFingers(hand) {
     let count = 0;
@@ -144,7 +231,7 @@ function detectGesture(hand) {
     const pinky = isFingerUp(hand, 20, 18);
     const count = countRaisedFingers(hand);
     const distThumbIndex = Math.hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y);
-    if (distThumbIndex < 0.05 && middle && ring && pinky) return "OK 👌";
+    if (distThumbIndex < OK_GESTURE_DISTANCE_THRESHOLD && middle && ring && pinky) return "OK 👌";
     if (count === 2) return "HI 👋";
     if (count === 4) return "HELP 🆘";
     return null;
@@ -184,49 +271,81 @@ function solveInverseBilinearInterpolation(p0, p1, p2, p3, p, maxIterations = 20
     return { u, v };
 }
 
+function scheduleDraw() {
+    if (typeof video.requestVideoFrameCallback === "function") {
+        video.requestVideoFrameCallback(() => {
+            drawScene();
+            scheduleDraw();
+        });
+    } else {
+        requestAnimationFrame(() => {
+            drawScene();
+            scheduleDraw();
+        });
+    }
+}
+
 async function startCamera() {
     try {
         const videoConstraints = isMobile
-            ? { facingMode: { ideal: "user" }, width: { ideal: 960, max: 1280 }, height: { ideal: 540, max: 720 } }
+            ? { facingMode: { ideal: "user" }, width: { ideal: 640, max: 960 }, height: { ideal: 360, max: 540 } }
             : { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } };
         const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
-        video.srcObject = stream; await video.play(); drawScene(); detectLoop();
+        video.srcObject = stream; await video.play(); scheduleDraw(); detectLoop();
     } catch (err) { info.innerText = "Không mở được camera: " + err.message; }
 }
 
 const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
-hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6, selfieMode: true });
+hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: PERF.handModelComplexity,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+    selfieMode: true
+});
 hands.onResults(res => { 
     latestHandResult = res; 
+    if (res.multiHandedness && res.multiHandedness.length > 0) {
+        stableHandedness = res.multiHandedness.map(h => ({ ...h }));
+    }
     updateSmoothedHands(res.multiHandLandmarks || []); 
 });
 
 const faceMesh = new FaceMesh({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
-faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5, selfieMode: true });
-faceMesh.onResults(res => { latestFaceResult = res; });
+faceMesh.setOptions({
+    maxNumFaces: 1,
+    refineLandmarks: PERF.faceRefineLandmarks,
+    minDetectionConfidence: 0.45,
+    minTrackingConfidence: 0.45,
+    selfieMode: true
+});
+faceMesh.onResults(res => {
+    latestFaceResult = res;
+    const face = res?.multiFaceLandmarks?.[0];
+    if (face) {
+        lastFaceLandmarks = face;
+        lastFaceSeenAt = performance.now();
+    }
+});
 
 function drawScene() {
-    if (video.readyState >= 2) {
+    if (video.readyState < 2) return;
         const rect = getDrawRect();
         const uiScale = getUiScale();
         const baseLabelFont = Math.round(16 * uiScale);
         const gestureFont = Math.round(26 * uiScale);
         const statusFont = Math.round(26 * uiScale);
-        const handLineWidth = clamp(5 * uiScale, 3, 5);
-        const pointRadius = clamp(5 * uiScale, 3, 5);
         const strokeThin = clamp(1.5 * uiScale, 1.1, 1.5);
         const safeMargin = Math.round(clamp(canvas.width * 0.02, 12, 24));
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.save(); ctx.translate(rect.offsetX + rect.drawWidth, rect.offsetY); ctx.scale(-1, 1);
         ctx.drawImage(video, 0, 0, rect.drawWidth, rect.drawHeight); ctx.restore();
 
+        const now = performance.now();
         let faceFound = false;
-        if (latestFaceResult?.multiFaceLandmarks?.length > 0) {
-            faceFound = true; const face = latestFaceResult.multiFaceLandmarks[0];
-            ctx.strokeStyle = "#00bfff"; ctx.lineWidth = strokeThin; ctx.beginPath();
-            const oval = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10];
-            for(let i=0; i < oval.length; i++) { const pt = mapPoint(face[oval[i]], rect); if(i===0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y); }
-            ctx.stroke();
+        const face = latestFaceResult?.multiFaceLandmarks?.[0] || ((now - lastFaceSeenAt) <= PERF.faceHoldMs ? lastFaceLandmarks : null);
+        if (face) {
+            faceFound = true;
             const avgEARRaw = (calculateEAR([33, 160, 158, 133, 153, 144], face) + calculateEAR([362, 385, 387, 263, 373, 380], face)) / 2.0;
             if (Number.isFinite(avgEARRaw) && avgEARRaw > 0) {
                 smoothedEAR = smoothedEAR === null ? avgEARRaw : (smoothedEAR * 0.75 + avgEARRaw * 0.25);
@@ -241,19 +360,53 @@ function drawScene() {
                 const isCalibrated = earStableFrames >= EAR_CALIBRATION_FRAMES;
 
                 if (isCalibrated && smoothedEAR < dynamicEarThreshold) {
-                    const now = performance.now();
+                    eyeOpenSince = null;
                     if (eyeClosedSince === null) eyeClosedSince = now;
                     isSleeping = (now - eyeClosedSince) >= CLOSED_DURATION_MS_THRESHOLD;
                     faceStatus = isSleeping ? "BUỒN NGỦ!" : "Đang nhắm mắt...";
                 } else {
                     eyeClosedSince = null;
-                    isSleeping = false;
-                    faceStatus = isCalibrated ? "Tỉnh táo" : "Đang hiệu chỉnh mắt...";
+                    if (isSleeping) {
+                        if (eyeOpenSince === null) eyeOpenSince = now;
+                        if ((now - eyeOpenSince) >= EYE_OPEN_CONFIRM_MS) {
+                            isSleeping = false;
+                            faceStatus = isCalibrated ? "Tỉnh táo" : "Đang hiệu chỉnh mắt...";
+                        } else {
+                            faceStatus = "BUỒN NGỦ!";
+                        }
+                    } else {
+                        eyeOpenSince = null;
+                        faceStatus = isCalibrated ? "Tỉnh táo" : "Đang hiệu chỉnh mắt...";
+                    }
                 }
             } else {
                 eyeClosedSince = null;
-                isSleeping = false;
-                faceStatus = "Đang theo dõi mắt...";
+                if (isSleeping) {
+                    if (eyeOpenSince === null) eyeOpenSince = now;
+                    if ((now - eyeOpenSince) >= EYE_OPEN_CONFIRM_MS) {
+                        isSleeping = false;
+                        faceStatus = "Đang theo dõi mắt...";
+                    } else {
+                        faceStatus = "BUỒN NGỦ!";
+                    }
+                } else {
+                    eyeOpenSince = null;
+                    faceStatus = "Đang theo dõi mắt...";
+                }
+            }
+        } else {
+            eyeClosedSince = null;
+            if (isSleeping) {
+                if (eyeOpenSince === null) eyeOpenSince = now;
+                if ((now - eyeOpenSince) >= EYE_OPEN_CONFIRM_MS) {
+                    isSleeping = false;
+                    faceStatus = "Đang theo dõi mặt...";
+                } else {
+                    faceStatus = "BUỒN NGỦ!";
+                }
+            } else {
+                eyeOpenSince = null;
+                faceStatus = "Đang theo dõi mặt...";
             }
         }
 
@@ -262,36 +415,57 @@ function drawScene() {
 
         let facesToDraw = [];
         const cx = canvas.width / 2; const cy = canvas.height / 2;
+        const cosX = Math.cos(rotationAngle);
+        const sinX = Math.sin(rotationAngle);
+        const cosY = Math.cos(rotationAngleY);
+        const sinY = Math.sin(rotationAngleY);
 
         if (boxes3D.length > 0) {
             boxes3D.forEach(b => {
-                let vertices = [{x:-1,y:-1,z:-1},{x:1,y:-1,z:-1},{x:1,y:1,z:-1},{x:-1,y:1,z:-1},{x:-1,y:-1,z:1},{x:1,y:-1,z:1},{x:1,y:1,z:1},{x:-1,y:1,z:1}];
-                let projected = vertices.map(v => {
-                    let vx = (v.x * BOX_SIZE/2) + (b.gridX - cx);
-                    let vy = (v.y * BOX_SIZE/2) + (b.gridY - cy);
-                    let vz = (v.z * BOX_SIZE/2) + (b.z);
-                    let tx = vx * Math.cos(rotationAngle) - vz * Math.sin(rotationAngle);
-                    let tz = vx * Math.sin(rotationAngle) + vz * Math.cos(rotationAngle);
+                let projected = BOX_VERTICES.map(v => {
+                    let vx = (v.x * BOX_SIZE / 2) + (b.gridX - cx);
+                    let vy = (v.y * BOX_SIZE / 2) + (b.gridY - cy);
+                    let vz = (v.z * BOX_SIZE / 2) + b.z;
+                    let tx = vx * cosX - vz * sinX;
+                    let tz = vx * sinX + vz * cosX;
                     vx = tx; vz = tz;
-                    let ty = vy * Math.cos(rotationAngleY) - vz * Math.sin(rotationAngleY);
-                    vz = vy * Math.sin(rotationAngleY) + vz * Math.cos(rotationAngleY);
+                    let ty = vy * cosY - vz * sinY;
+                    vz = vy * sinY + vz * cosY;
                     vy = ty;
                     return { x: vx + cx, y: vy + cy, z: vz };
                 });
-                let boxFaces = [{i:[0,1,2,3],c:"#1976D2"},{i:[4,5,6,7],c:"#42A5F5"},{i:[0,1,5,4],c:"#90CAF9"},{i:[2,3,7,6],c:"#0D47A1"},{i:[0,3,7,4],c:"#1E88E5"},{i:[1,2,6,5],c:"#1565C0"}];
-                boxFaces.forEach((f, i) => {
-                    f.z = (projected[f.i[0]].z + projected[f.i[1]].z + projected[f.i[2]].z + projected[f.i[3]].z) / 4;
-                    f.pts = [projected[f.i[0]], projected[f.i[1]], projected[f.i[2]], projected[f.i[3]]];
-                    f.sourceBox = b; f.faceIndex = i; f.color = f.c;
-                    facesToDraw.push(f);
+                BOX_FACES.forEach((f, i) => {
+                    const p0 = projected[f.i[0]];
+                    const p1 = projected[f.i[1]];
+                    const p2 = projected[f.i[2]];
+                    const p3 = projected[f.i[3]];
+                    const centerX = (p0.x + p1.x + p2.x + p3.x) / 4;
+                    const centerY = (p0.y + p1.y + p2.y + p3.y) / 4;
+                    const minX = Math.min(p0.x, p1.x, p2.x, p3.x);
+                    const maxX = Math.max(p0.x, p1.x, p2.x, p3.x);
+                    const minY = Math.min(p0.y, p1.y, p2.y, p3.y);
+                    const maxY = Math.max(p0.y, p1.y, p2.y, p3.y);
+                    facesToDraw.push({
+                        z: (p0.z + p1.z + p2.z + p3.z) / 4,
+                        pts: [p0, p1, p2, p3],
+                        sourceBox: b,
+                        faceIndex: i,
+                        color: f.c,
+                        centerX,
+                        centerY,
+                        minX,
+                        maxX,
+                        minY,
+                        maxY
+                    });
                 });
             });
         }
 
-        // Vẽ tay bằng dữ liệu đã smooth để đỡ giật
+        // Xử lý tay 
         if (smoothedHands.length > 0) {
             smoothedHands.forEach((hand, handIdx) => {
-                const label = latestHandResult?.multiHandedness[handIdx]?.label || "Unknown";
+                const label = stableHandedness[handIdx]?.label || latestHandResult?.multiHandedness[handIdx]?.label || "Unknown";
                 const fingersUp = countRaisedFingers(hand);
                 const mappedPoints = hand.map(pt => mapPoint(pt, rect));
                 const wrist = mappedPoints[0];
@@ -302,8 +476,20 @@ function drawScene() {
                 ctx.fillText(`Tay ${handIdx + 1} (${label}) | ${fingersUp} ngón`, wrist.x + labelOffsetX, wrist.y - labelOffsetY);
 
                 if (label === "Left") {
-                    if (fingersUp === 5) boxes3D = [];
-                    if (fingersUp === 1) lightOn = true; else if (fingersUp === 0) lightOn = false;
+                    if (leftFingerCandidate === fingersUp) leftFingerStableFrames++;
+                    else {
+                        leftFingerCandidate = fingersUp;
+                        leftFingerStableFrames = 1;
+                    }
+                    if (leftFingerStableFrames >= LEFT_ACTION_STABLE_FRAMES) {
+                        leftFingerStable = leftFingerCandidate;
+                    }
+                    if (leftFingerStable === 5 && (now - lastLeftClearAt) > LEFT_CLEAR_COOLDOWN_MS) {
+                        boxes3D = [];
+                        lastLeftClearAt = now;
+                    }
+                    if (leftFingerStable === 1) lightOn = true;
+                    else if (leftFingerStable === 0) lightOn = false;
                     const gst = detectGesture(hand);
                     if (gst) { ctx.fillStyle = "#FFD700"; ctx.font = `bold ${gestureFont}px sans-serif`; ctx.fillText(gst, wrist.x + labelOffsetX, wrist.y - Math.round(40 * uiScale)); }
                 }
@@ -327,25 +513,53 @@ function drawScene() {
                     }
 
                     const distPinch = Math.hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y);
-                    if (distPinch < 0.05) {
+                    if (distPinch < PINCH_DISTANCE_THRESHOLD && performance.now() - lastPinchHitTestAt >= PERF.pinchHitTestMs) {
+                        lastPinchHitTestAt = performance.now();
                         const mx = (mappedPoints[4].x + mappedPoints[8].x) / 2, my = (mappedPoints[4].y + mappedPoints[8].y) / 2;
                         let hit = null;
-                        let sortedFaces = [...facesToDraw].sort((a,b) => b.z - a.z);
-                        sortedFaces.forEach(f => {
+                        let hitZ = -Infinity;
+                        const hitPadding = Math.round(clamp(10 * uiScale, 8, 14));
+                        for (let i = 0; i < facesToDraw.length; i++) {
+                            const f = facesToDraw[i];
+                            if (mx < (f.minX - hitPadding) || mx > (f.maxX + hitPadding) || my < (f.minY - hitPadding) || my > (f.maxY + hitPadding)) continue;
                             ctx.beginPath(); ctx.moveTo(f.pts[0].x, f.pts[0].y); ctx.lineTo(f.pts[1].x, f.pts[1].y); ctx.lineTo(f.pts[2].x, f.pts[2].y); ctx.lineTo(f.pts[3].x, f.pts[3].y); ctx.closePath();
-                            if (ctx.isPointInPath(mx, my)) hit = f;
-                        });
-                        if (!hit && performance.now() - lastBoxTime > 150) {
-                            const gx = Math.round(mx / BOX_SIZE) * BOX_SIZE, gy = Math.round(my / BOX_SIZE) * BOX_SIZE;
-                            if (!boxes3D.find(b => b.gridX === gx && b.gridY === gy)) { boxes3D.push({ gridX: gx, gridY: gy, z: 0, faceDrawings: Array(6).fill().map(() => []) }); lastBoxTime = performance.now(); }
+                            const inPath = ctx.isPointInPath(mx, my);
+                            if (inPath && f.z > hitZ) {
+                                hit = f;
+                                hitZ = f.z;
+                            }
+                        }
+                        if (!hit && facesToDraw.length > 0) {
+                            let best = null;
+                            let bestDist = Infinity;
+                            for (let i = 0; i < facesToDraw.length; i++) {
+                                const f = facesToDraw[i];
+                                const dx = f.centerX - mx;
+                                const dy = f.centerY - my;
+                                const d = dx * dx + dy * dy;
+                                if (d < bestDist) {
+                                    bestDist = d;
+                                    best = f;
+                                }
+                            }
+                            const maxFallbackDist = (BOX_SIZE * 1.25) * (BOX_SIZE * 1.25);
+                            if (best && bestDist <= maxFallbackDist) hit = best;
+                        }
+                        if (performance.now() - lastBoxTime > BOX_ADD_COOLDOWN_MS) {
+                            if (hit) {
+                                const normal = FACE_NORMALS[hit.faceIndex] || { x: 0, y: 0, z: 1 };
+                                const nextX = hit.sourceBox.gridX + normal.x * BOX_SIZE;
+                                const nextY = hit.sourceBox.gridY + normal.y * BOX_SIZE;
+                                const nextZ = (hit.sourceBox.z || 0) + normal.z * BOX_SIZE;
+                                addBoxAt(nextX, nextY, nextZ);
+                            } else if (boxes3D.length === 0) {
+                                const gx = Math.round(mx / BOX_SIZE) * BOX_SIZE;
+                                const gy = Math.round(my / BOX_SIZE) * BOX_SIZE;
+                                addBoxAt(gx, gy, 0);
+                            }
                         }
                     }
                 }
-
-                ctx.strokeStyle = "rgba(0, 255, 250, 0.8)"; ctx.lineWidth = handLineWidth; ctx.lineCap = "round"; ctx.beginPath();
-                HAND_CONNECTIONS.forEach(([s, e]) => { ctx.moveTo(mappedPoints[s].x, mappedPoints[s].y); ctx.lineTo(mappedPoints[e].x, mappedPoints[e].y); });
-                ctx.stroke();
-                ctx.fillStyle = "#FFD700"; mappedPoints.forEach(pt => { ctx.beginPath(); ctx.arc(pt.x, pt.y, pointRadius, 0, 2 * Math.PI); ctx.fill(); });
             });
         }
 
@@ -360,9 +574,15 @@ function drawScene() {
         }
 
         if (lightOn) {
-            const glow = ctx.createRadialGradient(cx, cy, Math.round(clamp(40 * uiScale, 24, 40)), cx, cy, Math.max(canvas.width, canvas.height)/1.3);
-            glow.addColorStop(0, "rgba(211,255,180,0.3)"); glow.addColorStop(1, "rgba(255,220,80,0)");
-            ctx.fillStyle = glow; ctx.fillRect(0, 0, canvas.width, canvas.height);
+            if (!cachedGlowGradient || cachedGlowWidth !== canvas.width || cachedGlowHeight !== canvas.height) {
+                cachedGlowGradient = ctx.createRadialGradient(cx, cy, Math.round(clamp(40 * uiScale, 24, 40)), cx, cy, Math.max(canvas.width, canvas.height) / 1.3);
+                cachedGlowGradient.addColorStop(0, "rgba(211,255,180,0.3)");
+                cachedGlowGradient.addColorStop(1, "rgba(255,220,80,0)");
+                cachedGlowWidth = canvas.width;
+                cachedGlowHeight = canvas.height;
+            }
+            ctx.fillStyle = cachedGlowGradient;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
         }
 
         ctx.fillStyle = isSleeping ? "#ff3333" : (faceFound ? "#00ffcc" : "#aaaaaa"); ctx.font = `bold ${statusFont}px sans-serif`;
@@ -381,19 +601,35 @@ function drawScene() {
             ctx.fillText(warningText, cx, cy);
             ctx.textAlign = "left";
         }
-        const now = performance.now(); renderFps = 1000 / (now - lastTime); lastTime = now;     
-        info.innerText = `FPS: ${renderFps.toFixed(1)} | Tay: ${smoothedHands.length} | Mặt: ${faceStatus}`;
-    }
-    requestAnimationFrame(drawScene);
+        const frameNow = performance.now();
+        renderFps = 1000 / (frameNow - lastTime);
+        lastTime = frameNow;
+        if (frameNow - lastInfoUpdateAt >= PERF.infoRefreshMs) {
+            info.innerText = `FPS: ${renderFps.toFixed(1)} | Tay: ${smoothedHands.length} | Mặt: ${faceStatus}`;
+            lastInfoUpdateAt = frameNow;
+        }
 }
 
 async function detectLoop() {
-    if (video.readyState >= 2 && !detectBusy) {
+    const now = performance.now();
+    if (video.readyState >= 2 && !detectBusy && (now - lastDetectAt) >= PERF.detectIntervalMs) {
         detectBusy = true;
-        try { await hands.send({ image: video }); await faceMesh.send({ image: video }); }
+        lastDetectAt = now;
+        try {
+            if (isMobile) {
+                if (detectPhase === 0) await hands.send({ image: video });
+                else await faceMesh.send({ image: video });
+                detectPhase = (detectPhase + 1) % 2;
+            } else {
+                await hands.send({ image: video });
+                await faceMesh.send({ image: video });
+            }
+        }
         catch(e) { console.error(e); }
         finally { detectBusy = false; }
     }
-    requestAnimationFrame(detectLoop);
+    const elapsed = performance.now() - now;
+    const waitMs = video.readyState >= 2 ? Math.max(8, PERF.detectIntervalMs - elapsed) : 40;
+    setTimeout(detectLoop, waitMs);
 }
 startCamera();
