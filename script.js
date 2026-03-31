@@ -13,7 +13,7 @@ let latestFaceResult = null;
 let smoothedHands = [];
 let lightOn = false;
 
-// --- BIẾN CHO TÍNH NĂNG MÔ HÌNH 3D ---
+// State cho khối 3D
 let boxes3D = [];
 let rotationAngle = 0;
 let rotationAngleY = 0; 
@@ -22,16 +22,15 @@ const BOX_SIZE = 40;
 let wasZeroFingers = false;
 let lastHandX = 0;
 let lastHandY = 0; 
-// ------------------------------------
 
-// Cấu hình cảnh báo
+// Config cảnh báo buồn ngủ
 let eyeClosedFrames = 0;
 const EAR_THRESHOLD = 0.22; 
 const CLOSED_FRAMES_THRESHOLD = 15; 
 let faceStatus = "Tỉnh táo";
 let isSleeping = false;
 
-// --- HỆ THỐNG ÂM THANH (WEB AUDIO API) ---
+// Audio cảnh báo (Web Audio API)
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 let alarmInterval = null;
 
@@ -257,7 +256,7 @@ function drawScene() {
             });
         }
 
-        // VẼ TAY: SỬ DỤNG smoothedHands ĐỂ BÁM THEO MƯỢT MÀ, KHÔNG NHẢY
+        // Vẽ tay bằng dữ liệu đã smooth để đỡ giật
         if (smoothedHands.length > 0) {
             smoothedHands.forEach((hand, handIdx) => {
                 const label = latestHandResult?.multiHandedness[handIdx]?.label || "Unknown";
@@ -318,7 +317,7 @@ function drawScene() {
             });
         }
 
-        // VẼ KHỐI 3D: ĐÃ LOẠI BỎ PHẦN VẼ CHẤM (FACE DRAWINGS)
+        // Render khối 3D (không dùng face drawings nữa)
         if (facesToDraw.length > 0) {
             facesToDraw.sort((a, b) => a.z - b.z);
             facesToDraw.forEach(f => {
