@@ -140,10 +140,10 @@ const ROTATE_DEADZONE = 0.0015;
 const ROTATION_SENSITIVITY = 5.8;
 
 // Config cảnh báo buồn ngủ
-const EYE_CLOSED_THRESHOLD = isMobile ? 0.30 : 0.28;
-const CLOSED_DURATION_MS_THRESHOLD = 2200;
+const EYE_CLOSED_THRESHOLD = isMobile ? 0.16 : 0.18;
+const CLOSED_DURATION_MS_THRESHOLD = 1200;
 const EYE_OPEN_CONFIRM_MS = 270;
-const EAR_SMOOTHING_ALPHA = 0.60;
+const EAR_SMOOTHING_ALPHA = 0.45;
 let smoothedEAR = null;
 let eyeClosedSince = null;
 let eyeOpenSince = null;
