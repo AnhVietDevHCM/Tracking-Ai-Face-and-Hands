@@ -140,11 +140,16 @@ const ROTATE_DEADZONE = 0.0015;
 const ROTATION_SENSITIVITY = 5.8;
 
 // Config cảnh báo buồn ngủ
-const EYE_CLOSED_THRESHOLD = isMobile ? 0.16 : 0.18;
-const CLOSED_DURATION_MS_THRESHOLD = 1200;
-const EYE_OPEN_CONFIRM_MS = 270;
-const EAR_SMOOTHING_ALPHA = 0.45;
+const EAR_MIN_THRESHOLD = 0.14;
+const EAR_MAX_THRESHOLD = 0.22;
+const EAR_RATIO_FROM_BASELINE = 0.72;
+const CLOSED_DURATION_MS_THRESHOLD = 3000;
+const EYE_OPEN_CONFIRM_MS = 450;
+const EAR_CALIBRATION_FRAMES = 20;
+let earBaseline = null;
 let smoothedEAR = null;
+let earStableFrames = 0;
+let dynamicEarThreshold = EAR_MAX_THRESHOLD;
 let eyeClosedSince = null;
 let eyeOpenSince = null;
 let faceStatus = "Tỉnh táo";
@@ -748,10 +753,17 @@ function drawScene() {
         faceFound = true;
         const avgEARRaw = (calculateEAR([33, 160, 158, 133, 153, 144], face) + calculateEAR([362, 385, 387, 263, 373, 380], face)) / 2.0;
         if (Number.isFinite(avgEARRaw) && avgEARRaw > 0) {
-            smoothedEAR = smoothedEAR === null ? avgEARRaw : (smoothedEAR * (1 - EAR_SMOOTHING_ALPHA) + avgEARRaw * EAR_SMOOTHING_ALPHA);
-            const isClosed = smoothedEAR < EYE_CLOSED_THRESHOLD;
+            smoothedEAR = smoothedEAR === null ? avgEARRaw : (smoothedEAR * 0.75 + avgEARRaw * 0.25);
+            if (earBaseline === null) earBaseline = smoothedEAR;
+            else {
+                const alpha = smoothedEAR > earBaseline ? 0.08 : 0.01;
+                earBaseline = earBaseline * (1 - alpha) + smoothedEAR * alpha;
+            }
+            dynamicEarThreshold = clamp(earBaseline * EAR_RATIO_FROM_BASELINE, EAR_MIN_THRESHOLD, EAR_MAX_THRESHOLD);
+            earStableFrames++;
+            const isCalibrated = earStableFrames >= EAR_CALIBRATION_FRAMES;
 
-            if (isClosed) {
+            if (isCalibrated && smoothedEAR < dynamicEarThreshold) {
                 eyeOpenSince = null;
                 if (eyeClosedSince === null) eyeClosedSince = now;
                 isSleeping = (now - eyeClosedSince) >= CLOSED_DURATION_MS_THRESHOLD;
@@ -762,11 +774,11 @@ function drawScene() {
                     if (eyeOpenSince === null) eyeOpenSince = now;
                     if ((now - eyeOpenSince) >= EYE_OPEN_CONFIRM_MS) {
                         isSleeping = false;
-                        faceStatus = "Tỉnh táo";
+                        faceStatus = isCalibrated ? "Tỉnh táo" : "Đang hiệu chỉnh mắt...";
                     } else faceStatus = "BUỒN NGỦ!";
                 } else {
                     eyeOpenSince = null;
-                    faceStatus = "Tỉnh táo";
+                    faceStatus = isCalibrated ? "Tỉnh táo" : "Đang hiệu chỉnh mắt...";
                 }
             }
         } else {
