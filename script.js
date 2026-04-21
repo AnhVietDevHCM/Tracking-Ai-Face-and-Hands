@@ -1,0 +1,1394 @@
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d", { alpha: false });
+const info = document.getElementById("info");
+const audioBtn = document.getElementById("start-audio-btn");
+const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+const { abs, max, min, hypot, cos, sin, round, sqrt, acos } = Math;
+const MOBILE_JOINT_INDICES = [0, 4, 8, 12, 16, 20];
+const ALL_JOINT_INDICES = [...Array(21).keys()];
+const MAX_HANDS = 2;
+
+let lastTime = performance.now();
+let renderFps = 0;
+let detectBusy = false;
+let latestFaceResult = null;
+let smoothedHands = [];
+let stableHandedness = [];
+let latestHandsRaw = [];
+let handsMissingSince = null;
+let lastFaceLandmarks = null;
+let smoothedFaceLandmarks = null;
+let lastFaceSeenAt = 0;
+let lightOn = false;
+let cachedGlowGradient = null;
+let cachedGlowWidth = 0;
+let cachedGlowHeight = 0;
+let lastDetectAt = 0;
+let detectPhase = 0;
+let lastPinchHitTestAt = 0;
+let lastInfoUpdateAt = 0;
+let lastRenderAt = 0;
+let lastHandsResultAt = 0;
+let lastFaceResultAt = 0;
+let detectorRestarting = false;
+let lastDetectorRestartAt = 0;
+let hands = null;
+let faceMesh = null;
+
+const PERF = {
+    detectIntervalMs: isMobile ? 60 : 45,
+    renderIntervalMs: isMobile ? 45 : 33,
+    renderScale: isMobile ? 0.60 : 0.55,
+    maxBoxes: isMobile ? 8 : 5,
+    handModelComplexity: 0,
+    faceRefineLandmarks: false,
+    pinchHitTestMs: isMobile ? 80 : 40,
+    infoRefreshMs: 200,
+    handHoldMs: 220,
+    faceHoldMs: 360,
+    detectCallTimeoutMs: isMobile ? 5500 : 6500,
+    detectorStaleMs: isMobile ? 2300 : 2600,
+    detectorRestartCooldownMs: isMobile ? 3200 : 2800,
+    faceDetectEveryNthLoop: isMobile ? 3 : 2
+};
+
+const BOX_VERTICES = [
+    { x: -1, y: -1, z: -1 },
+    { x: 1, y: -1, z: -1 },
+    { x: 1, y: 1, z: -1 },
+    { x: -1, y: 1, z: -1 },
+    { x: -1, y: -1, z: 1 },
+    { x: 1, y: -1, z: 1 },
+    { x: 1, y: 1, z: 1 },
+    { x: -1, y: 1, z: 1 }
+];
+
+const BOX_FACES = [
+    { i: [0, 1, 2, 3], c: "#1976D2" },
+    { i: [4, 5, 6, 7], c: "#42A5F5" },
+    { i: [0, 1, 5, 4], c: "#90CAF9" },
+    { i: [2, 3, 7, 6], c: "#0D47A1" },
+    { i: [0, 3, 7, 4], c: "#1E88E5" },
+    { i: [1, 2, 6, 5], c: "#1565C0" }
+];
+
+const FACE_NORMALS = [
+    { x: 0, y: 0, z: -1 },
+    { x: 0, y: 0, z: 1 },
+    { x: 0, y: -1, z: 0 },
+    { x: 0, y: 1, z: 0 },
+    { x: -1, y: 0, z: 0 },
+    { x: 1, y: 0, z: 0 }
+];
+
+const HAND_CONNECTIONS = [
+    [0, 1], [1, 2], [2, 3], [3, 4],
+    [0, 5], [5, 6], [6, 7], [7, 8],
+    [5, 9], [9, 10], [10, 11], [11, 12],
+    [9, 13], [13, 14], [14, 15], [15, 16],
+    [13, 17], [17, 18], [18, 19], [19, 20],
+    [0, 17]
+];
+
+const FACE_OVAL_INDICES = [
+    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+    397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+    172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+];
+
+const facesToDraw = [];
+
+// State cho khối 3D
+let boxes3D = [];
+let rotationAngle = 0;
+let rotationAngleY = 0;
+let lastBoxTime = 0;
+const BOX_SIZE = 40;
+const BOX_ADD_COOLDOWN_MS = 85;
+let wasZeroFingers = false;
+let lastHandX = 0;
+let lastHandY = 0; 
+let pinchActive = false;
+let rightMode = "idle";
+let rightModeCandidate = "idle";
+let rightModeCandidateFrames = 0;
+let lastPinchPoint = null;
+let leftFingerCandidate = null;
+let leftFingerStableFrames = 0;
+let leftFingerStable = null;
+let leftGestureCandidate = null;
+let leftGestureStableFrames = 0;
+let leftGestureStable = null;
+let leftGestureLastSeenAt = 0;
+let leftHandLastSeenAt = 0;
+let lastLeftClearAt = 0;
+let handSideTracks = {
+    Left: { wrist: null, seenAt: 0 },
+    Right: { wrist: null, seenAt: 0 }
+};
+let singleHandLockLabel = null;
+let singleHandLockLastSeenAt = 0;
+const LEFT_ACTION_STABLE_FRAMES = 2;
+const LEFT_CLEAR_COOLDOWN_MS = 900;
+const GESTURE_STABLE_FRAMES = 2;
+const GESTURE_HOLD_MS = 220;
+const SIDE_TRACK_TIMEOUT_MS = 450;
+const SINGLE_HAND_LOCK_TIMEOUT_MS = 520;
+const SINGLE_HAND_LOCK_DISTANCE_BIAS = 0.008;
+const HAND_LABEL_CONFIDENCE = 0.7;
+const HAND_DUPLICATE_DISTANCE = 0.045;
+const RIGHT_MODE_STABLE_FRAMES = 3;
+const LEFT_HAND_LOST_RESET_MS = 240;
+const PINCH_MOVE_MIN = 0.015;
+const FINGER_UP_TOLERANCE = 0.045;
+const THUMB_EXTENSION_ANGLE_DEG = 150;
+const THUMB_OPEN_DISTANCE_MIN = 0.095;
+const THUMB_TO_INDEX_MCP_MIN = 0.07;
+const THUMB_TO_PALM_CENTER_MIN = 0.08;
+const THUMB_SEGMENT_DELTA_MIN = 0.015;
+const FINGER_CURL_TOLERANCE = 0.012;
+const FIST_CURL_MIN_FINGERS = 3;
+const FIST_FINGER_TO_PALM_RATIO = 1.05;
+const FIST_THUMB_TO_PALM_RATIO = 0.85;
+const PINCH_DISTANCE_THRESHOLD = 0.095;
+const PINCH_RELEASE_DISTANCE_THRESHOLD = 0.125;
+const ROTATE_ENTRY_PINCH_DISTANCE = 0.16;
+const STRONG_PINCH_DISTANCE_THRESHOLD = 0.072;
+const OK_GESTURE_DISTANCE_THRESHOLD = 0.095;
+const ROTATE_DEADZONE = 0.0015;
+const ROTATION_SENSITIVITY = 5.8;
+const FACE_SMOOTH_ALPHA_STILL = 0.86;
+const FACE_SMOOTH_ALPHA_MEDIUM = 0.68;
+const FACE_SMOOTH_ALPHA_FAST = 0.45;
+
+// Config cảnh báo buồn ngủ
+const EYE_CLOSED_THRESHOLD = 0.35;
+const EYE_CLOSED_DURATION_MS = 3000;
+const EYE_OPEN_CONFIRM_MS = 300;
+const EAR_SMOOTHING_ALPHA = 0.20;
+let smoothedEAR = null;
+let latestEAR = null;
+let eyeClosedSince = null;
+let eyeOpenSince = null;
+let faceStatus = "Tỉnh táo";
+let isSleeping = false;
+
+// Audio cảnh báo (Web Audio API)
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+let alarmInterval = null;
+
+audioBtn.addEventListener('click', () => {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    audioBtn.style.display = 'none';
+});
+
+function playBeep() {
+    if (audioCtx.state === 'suspended') return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'square'; 
+    osc.frequency.setValueAtTime(880, audioCtx.currentTime); 
+    gain.gain.setValueAtTime(0.5, audioCtx.currentTime); 
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3); 
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.3);
+}
+
+function resize() {
+    const viewportWidth = round(window.visualViewport?.width || window.innerWidth);
+    const viewportHeight = round(window.visualViewport?.height || window.innerHeight);
+    const renderWidth = max(320, round(viewportWidth * PERF.renderScale));
+    const renderHeight = max(180, round(viewportHeight * PERF.renderScale));
+    if (canvas.width === renderWidth && canvas.height === renderHeight) return;
+    canvas.width = renderWidth;
+    canvas.height = renderHeight;
+    canvas.style.width = `${viewportWidth}px`;
+    canvas.style.height = `${viewportHeight}px`;
+    cachedGlowGradient = null;
+    cachedGlowWidth = 0;
+    cachedGlowHeight = 0;
+}
+window.addEventListener("resize", resize);
+if (isMobile) window.visualViewport?.addEventListener("resize", resize);
+resize();
+
+function clamp(value, minValue, maxValue) {
+    return min(maxValue, max(minValue, value));
+}
+
+function hasBoxAt(x, y, z, tolerance = BOX_SIZE * 0.28) {
+    return boxes3D.some(b =>
+        abs(b.gridX - x) <= tolerance &&
+        abs(b.gridY - y) <= tolerance &&
+        abs((b.z || 0) - z) <= tolerance
+    );
+}
+
+function addBoxAt(x, y, z) {
+    if (hasBoxAt(x, y, z)) return false;
+    boxes3D.push({ gridX: x, gridY: y, z });
+    if (boxes3D.length > PERF.maxBoxes) boxes3D.shift();
+    lastBoxTime = performance.now();
+    return true;
+}
+
+function getUiScale() {
+    return clamp(canvas.width / 1280, 0.75, 1);
+}
+
+function getDrawRect() {
+    const vw = video.videoWidth || 640;
+    const vh = video.videoHeight || 480;
+    const scale = max(canvas.width / vw, canvas.height / vh);
+    const drawWidth = vw * scale;
+    const drawHeight = vh * scale;
+    const offsetX = (canvas.width - drawWidth) / 2;
+    const offsetY = (canvas.height - drawHeight) / 2;
+    return { vw, vh, drawWidth, drawHeight, offsetX, offsetY };
+}
+
+function mapPoint(p, rect) {
+    return { x: rect.offsetX + p.x * rect.drawWidth, y: rect.offsetY + p.y * rect.drawHeight };
+}
+
+function smoothPoint(prev, next, alpha = 0.6) { 
+    if (!prev) return { x: next.x, y: next.y, z: next.z || 0 };
+    return { 
+        x: prev.x * alpha + next.x * (1 - alpha), 
+        y: prev.y * alpha + next.y * (1 - alpha), 
+        z: (prev.z || 0) * alpha + (next.z || 0) * (1 - alpha) 
+    };
+}
+
+function getPointDistance(a, b) {
+    if (!a || !b) return Infinity;
+    return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function cloneLandmarks(landmarks) {
+    return landmarks.map(point => ({ x: point.x, y: point.y, z: point.z || 0 }));
+}
+
+function getAdaptiveFaceSmoothingAlpha(prevFace, currentFace) {
+    if (!prevFace || !currentFace) return 0;
+    const prevNose = prevFace[1];
+    const currNose = currentFace[1];
+    const movement = getPointDistance(prevNose, currNose);
+    if (!Number.isFinite(movement)) return FACE_SMOOTH_ALPHA_MEDIUM;
+    if (movement > 0.035) return FACE_SMOOTH_ALPHA_FAST;
+    if (movement > 0.015) return FACE_SMOOTH_ALPHA_MEDIUM;
+    return FACE_SMOOTH_ALPHA_STILL;
+}
+
+function updateSmoothedFace(faceLandmarks) {
+    if (!faceLandmarks || faceLandmarks.length === 0) {
+        smoothedFaceLandmarks = null;
+        return;
+    }
+    if (!smoothedFaceLandmarks || smoothedFaceLandmarks.length !== faceLandmarks.length) {
+        smoothedFaceLandmarks = cloneLandmarks(faceLandmarks);
+        return;
+    }
+    const alpha = getAdaptiveFaceSmoothingAlpha(smoothedFaceLandmarks, faceLandmarks);
+    if (alpha <= 0) {
+        smoothedFaceLandmarks = cloneLandmarks(faceLandmarks);
+        return;
+    }
+    smoothedFaceLandmarks = faceLandmarks.map((point, pointIndex) =>
+        smoothPoint(smoothedFaceLandmarks[pointIndex], point, alpha)
+    );
+}
+
+function isPointInTriangle(px, py, ax, ay, bx, by, cx, cy) {
+    const v0x = cx - ax;
+    const v0y = cy - ay;
+    const v1x = bx - ax;
+    const v1y = by - ay;
+    const v2x = px - ax;
+    const v2y = py - ay;
+    const dot00 = v0x * v0x + v0y * v0y;
+    const dot01 = v0x * v1x + v0y * v1y;
+    const dot02 = v0x * v2x + v0y * v2y;
+    const dot11 = v1x * v1x + v1y * v1y;
+    const dot12 = v1x * v2x + v1y * v2y;
+    const denom = (dot00 * dot11 - dot01 * dot01);
+    if (abs(denom) < 1e-8) return false;
+    const inv = 1 / denom;
+    const u = (dot11 * dot02 - dot01 * dot12) * inv;
+    const v = (dot00 * dot12 - dot01 * dot02) * inv;
+    return u >= 0 && v >= 0 && (u + v) <= 1;
+}
+
+function isPointInQuad(px, py, quad) {
+    const a = quad[0], b = quad[1], c = quad[2], d = quad[3];
+    return isPointInTriangle(px, py, a.x, a.y, b.x, b.y, c.x, c.y) ||
+        isPointInTriangle(px, py, a.x, a.y, c.x, c.y, d.x, d.y);
+}
+
+function normalizeHandLabel(label) {
+    if (typeof label !== "string") return null;
+    const normalized = label.trim().toLowerCase();
+    if (normalized === "left" || normalized === "trái" || normalized === "trai") return "Trái";
+    if (normalized === "right" || normalized === "phải" || normalized === "phai") return "Phải";
+    return null;
+}
+
+function sanitizeHandDetections(handLandmarks, handedness = []) {
+    if (!handLandmarks || handLandmarks.length === 0) return { hands: [], handedness: [] };
+    const pairs = handLandmarks.map((hand, idx) => ({
+        hand,
+        handedness: handedness[idx]
+            ? { ...handedness[idx], label: normalizeHandLabel(handedness[idx].label) }
+            : null,
+        score: Number.isFinite(handedness[idx]?.score) ? handedness[idx].score : 0
+    }));
+
+    pairs.sort((a, b) => b.score - a.score);
+
+    const kept = [];
+    for (let i = 0; i < pairs.length; i++) {
+        const candidate = pairs[i];
+        const candidateLabel = candidate.handedness?.label || null;
+        const isDuplicate = kept.some(existing =>
+            getPointDistance(existing.hand[0], candidate.hand[0]) < HAND_DUPLICATE_DISTANCE &&
+            (
+                !candidateLabel ||
+                !existing.handedness?.label ||
+                existing.handedness.label === candidateLabel
+            )
+        );
+        if (!isDuplicate) kept.push(candidate);
+    }
+
+    if (kept.length > MAX_HANDS) {
+        kept.sort((a, b) => b.score - a.score);
+        kept.length = MAX_HANDS;
+    }
+
+    kept.sort((a, b) => a.hand[0].x - b.hand[0].x);
+
+    return {
+        hands: kept.map(item => item.hand),
+        handedness: kept.map(item => item.handedness)
+    };
+}
+
+function resetRightInteraction(cx = null, cy = null, commitRotation = false) {
+    if (commitRotation && rightMode === "rotate" && Number.isFinite(cx) && Number.isFinite(cy)) {
+        commitRotationToBoxes(cx, cy);
+        rotationAngle = 0;
+        rotationAngleY = 0;
+    }
+    rightMode = "idle";
+    rightModeCandidate = "idle";
+    rightModeCandidateFrames = 0;
+    pinchActive = false;
+    wasZeroFingers = false;
+    lastPinchPoint = null;
+}
+
+function resetHandTrackingState(cx = null, cy = null, commitRotation = false) {
+    smoothedHands = [];
+    stableHandedness = [];
+    latestHandsRaw = [];
+    handsMissingSince = null;
+    leftFingerCandidate = null;
+    leftFingerStableFrames = 0;
+    leftFingerStable = null;
+    leftGestureCandidate = null;
+    leftGestureStableFrames = 0;
+    leftGestureStable = null;
+    leftGestureLastSeenAt = 0;
+    leftHandLastSeenAt = 0;
+    singleHandLockLabel = null;
+    singleHandLockLastSeenAt = 0;
+    handSideTracks = {
+        Left: { wrist: null, seenAt: 0 },
+        Right: { wrist: null, seenAt: 0 }
+    };
+    resetRightInteraction(cx, cy, commitRotation);
+}
+
+function resetFaceTrackingState() {
+    latestFaceResult = null;
+    lastFaceLandmarks = null;
+    smoothedFaceLandmarks = null;
+    lastFaceSeenAt = 0;
+    latestEAR = null;
+    smoothedEAR = null;
+    eyeClosedSince = null;
+    eyeOpenSince = null;
+    isSleeping = false;
+    faceStatus = "Đang theo dõi mặt...";
+}
+
+async function withTimeout(taskPromise, timeoutMs, tag = "detector") {
+    let timerId = null;
+    const timeoutPromise = new Promise((_, reject) => {
+        timerId = setTimeout(() => reject(new Error(`${tag} timeout after ${timeoutMs}ms`)), timeoutMs);
+    });
+    try {
+        return await Promise.race([taskPromise, timeoutPromise]);
+    } finally {
+        if (timerId !== null) clearTimeout(timerId);
+    }
+}
+
+function createHandsDetector() {
+    const detector = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+    detector.setOptions({
+        maxNumHands: MAX_HANDS,
+        modelComplexity: PERF.handModelComplexity,
+        minDetectionConfidence: 0.35,
+        minTrackingConfidence: 0.35,
+        selfieMode: true
+    });
+    detector.onResults(res => {
+        lastHandsResultAt = performance.now();
+        updateSmoothedHands(res.multiHandLandmarks || [], res.multiHandedness || []);
+    });
+    return detector;
+}
+
+function createFaceMeshDetector() {
+    const detector = new FaceMesh({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
+    detector.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: PERF.faceRefineLandmarks,
+        minDetectionConfidence: 0.45,
+        minTrackingConfidence: 0.5,
+        selfieMode: true
+    });
+    detector.onResults(res => {
+        lastFaceResultAt = performance.now();
+        latestFaceResult = res;
+        const face = res?.multiFaceLandmarks?.[0];
+        if (face) {
+            lastFaceLandmarks = cloneLandmarks(face);
+            updateSmoothedFace(lastFaceLandmarks);
+            lastFaceSeenAt = performance.now();
+        }
+    });
+    return detector;
+}
+
+function initDetectors() {
+    hands = createHandsDetector();
+    faceMesh = createFaceMeshDetector();
+}
+
+async function restartDetectors(reason = "unknown") {
+    const now = performance.now();
+    if (detectorRestarting) return;
+    if ((now - lastDetectorRestartAt) < PERF.detectorRestartCooldownMs) return;
+
+    detectorRestarting = true;
+    lastDetectorRestartAt = now;
+    try {
+        const oldHands = hands;
+        const oldFaceMesh = faceMesh;
+        hands = null;
+        faceMesh = null;
+
+        resetHandTrackingState();
+        resetFaceTrackingState();
+
+        if (oldHands?.close) {
+            try { await withTimeout(Promise.resolve(oldHands.close()), 1200, "hands.close"); }
+            catch (closeErr) { console.warn("hands.close failed", closeErr); }
+        }
+        if (oldFaceMesh?.close) {
+            try { await withTimeout(Promise.resolve(oldFaceMesh.close()), 1200, "faceMesh.close"); }
+            catch (closeErr) { console.warn("faceMesh.close failed", closeErr); }
+        }
+
+        initDetectors();
+        detectPhase = 0;
+        lastHandsResultAt = 0;
+        lastFaceResultAt = 0;
+    } catch (restartErr) {
+        console.error(`Restart detectors failed (${reason})`, restartErr);
+    } finally {
+        detectorRestarting = false;
+        detectBusy = false;
+    }
+}
+
+function resolveStableHandSides(hands, handedness = []) {
+    const now = performance.now();
+    const result = hands.map(() => ({ label: null, score: 1 }));
+    if (hands.length === 0) return result;
+
+    const raw = hands.map((_, idx) => {
+        const h = handedness[idx];
+        return {
+            label: normalizeHandLabel(h?.label),
+            score: Number.isFinite(h?.score) ? h.score : 0
+        };
+    });
+
+    if (hands.length === 1) {
+        const wrist = hands[0][0];
+        const leftTrack = handSideTracks.Left;
+        const rightTrack = handSideTracks.Right;
+        const leftRecent = leftTrack.wrist && (now - leftTrack.seenAt) <= SIDE_TRACK_TIMEOUT_MS;
+        const rightRecent = rightTrack.wrist && (now - rightTrack.seenAt) <= SIDE_TRACK_TIMEOUT_MS;
+        const dLeft = leftRecent ? getPointDistance(wrist, leftTrack.wrist) : Infinity;
+        const dRight = rightRecent ? getPointDistance(wrist, rightTrack.wrist) : Infinity;
+        const lockAlive = singleHandLockLabel && (now - singleHandLockLastSeenAt) <= SINGLE_HAND_LOCK_TIMEOUT_MS;
+
+        let label = null;
+        if (raw[0].label && raw[0].score >= HAND_LABEL_CONFIDENCE) {
+            label = raw[0].label;
+        } else if (leftRecent && rightRecent && abs(dLeft - dRight) > SINGLE_HAND_LOCK_DISTANCE_BIAS) {
+            label = dLeft <= dRight ? "Trái" : "Phải";
+        } else if (lockAlive) {
+            if (singleHandLockLabel === "Trái" && dLeft <= (dRight + SINGLE_HAND_LOCK_DISTANCE_BIAS)) {
+                label = "Trái";
+            } else if (singleHandLockLabel === "Phải" && dRight <= (dLeft + SINGLE_HAND_LOCK_DISTANCE_BIAS)) {
+                label = "Phải";
+            }
+        }
+
+        if (!label) {
+            if (leftRecent || rightRecent) label = dLeft <= dRight ? "Trái" : "Phải";
+            else label = wrist.x < 0.5 ? "Trái" : "Phải";
+        }
+
+        result[0] = { label, score: raw[0].score || 0.5 };
+        handSideTracks[label] = { wrist: { x: wrist.x, y: wrist.y }, seenAt: now };
+        singleHandLockLabel = label;
+        singleHandLockLastSeenAt = now;
+        return result;
+    }
+
+    const takenDetections = new Set();
+    const takenLabels = new Set();
+
+    ["Trái", "Phải"].forEach(label => {
+        let bestIdx = -1;
+        let bestScore = -1;
+        for (let i = 0; i < raw.length; i++) {
+            if (takenDetections.has(i)) continue;
+            if (raw[i].label !== label) continue;
+            if (raw[i].score < HAND_LABEL_CONFIDENCE) continue;
+            if (raw[i].score > bestScore) {
+                bestScore = raw[i].score;
+                bestIdx = i;
+            }
+        }
+        if (bestIdx >= 0) {
+            result[bestIdx] = { label, score: bestScore };
+            takenDetections.add(bestIdx);
+            takenLabels.add(label);
+        }
+    });
+
+    for (let i = 0; i < hands.length; i++) {
+        if (takenDetections.has(i)) continue;
+        let bestLabel = null;
+        let bestDist = Infinity;
+        ["Trái", "Phải"].forEach(label => {
+            if (takenLabels.has(label)) return;
+            const track = handSideTracks[label];
+            if (!track.wrist || (now - track.seenAt) > SIDE_TRACK_TIMEOUT_MS) return;
+            const dist = getPointDistance(hands[i][0], track.wrist);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestLabel = label;
+            }
+        });
+        if (bestLabel) {
+            result[i] = { label: bestLabel, score: raw[i].score || 0.5 };
+            takenDetections.add(i);
+            takenLabels.add(bestLabel);
+        }
+    }
+
+    const remainingIdx = [];
+    for (let i = 0; i < hands.length; i++) {
+        if (!takenDetections.has(i)) remainingIdx.push(i);
+    }
+    remainingIdx.sort((a, b) => hands[a][0].x - hands[b][0].x);
+    for (let k = 0; k < remainingIdx.length; k++) {
+        const i = remainingIdx[k];
+        let label;
+        if (!takenLabels.has("Trái")) label = "Trái";
+        else if (!takenLabels.has("Phải")) label = "Phải";
+        else {
+            label = k === 0 ? "Trái" : "Phải";
+        }
+        result[i] = { label, score: raw[i].score || 0.5 };
+        takenLabels.add(label);
+    }
+
+    // Step 4: update per-side tracks from resolved labels.
+    for (let i = 0; i < hands.length; i++) {
+        const label = result[i].label;
+        if (!label) continue;
+        handSideTracks[label] = {
+            wrist: { x: hands[i][0].x, y: hands[i][0].y },
+            seenAt: now
+        };
+        if (singleHandLockLabel === label) {
+            singleHandLockLastSeenAt = now;
+        }
+    }
+
+    return result;
+}
+
+function pickBestPreviousHand(currentHand, previousHands, usedPrevious) {
+    let bestIndex = -1;
+    let bestDist = Infinity;
+    const currWrist = currentHand[0];
+    for (let i = 0; i < previousHands.length; i++) {
+        if (usedPrevious.has(i)) continue;
+        const prevWrist = previousHands[i][0];
+        const dx = prevWrist.x - currWrist.x;
+        const dy = prevWrist.y - currWrist.y;
+        const dist = hypot(dx, dy);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestIndex = i;
+        }
+    }
+    if (bestIndex >= 0) usedPrevious.add(bestIndex);
+    return bestIndex;
+}
+
+function getAdaptiveHandSmoothingAlpha(prevHand, currentHand) {
+    if (!prevHand || !currentHand) return 0;
+    const wristDist = getPointDistance(prevHand[0], currentHand[0]);
+    if (!Number.isFinite(wristDist) || wristDist > 0.22) return 0;
+    if (wristDist > 0.12) return 0.08;
+    if (wristDist > 0.06) return 0.14;
+    return 0.2;
+}
+
+function updateSmoothedHands(handLandmarks, handedness = []) {
+    const sanitized = sanitizeHandDetections(handLandmarks, handedness);
+    const currentHandsRaw = sanitized.hands;
+    const currentHandedness = sanitized.handedness;
+
+    if (currentHandsRaw.length === 0) {
+        if (handsMissingSince === null) handsMissingSince = performance.now();
+        if (performance.now() - handsMissingSince > PERF.handHoldMs) {
+            resetHandTrackingState();
+        }
+        return;
+    }
+    handsMissingSince = null;
+    const currentHands = currentHandsRaw;
+    const currentResolvedSides = resolveStableHandSides(currentHands, currentHandedness);
+    const previousHands = smoothedHands;
+    const usedPrevious = new Set();
+    const prevByLabel = {};
+    for (let i = 0; i < stableHandedness.length; i++) {
+        const label = stableHandedness[i]?.label;
+        if (!label || prevByLabel[label] !== undefined) continue;
+        prevByLabel[label] = i;
+    }
+
+    const previousIndexByCurrent = currentHands.map((hand, handIndex) => {
+        const label = currentResolvedSides[handIndex]?.label;
+        if (label && prevByLabel[label] !== undefined && !usedPrevious.has(prevByLabel[label])) {
+            usedPrevious.add(prevByLabel[label]);
+            return prevByLabel[label];
+        }
+        return pickBestPreviousHand(hand, previousHands, usedPrevious);
+    });
+
+    smoothedHands = currentHands.map((hand, handIndex) => {
+        const prevIdx = previousIndexByCurrent[handIndex];
+        const previousHand = prevIdx >= 0 ? previousHands[prevIdx] : null;
+        const alpha = getAdaptiveHandSmoothingAlpha(previousHand, hand);
+        if (alpha === 0 || !previousHand) {
+            return hand.map(point => ({ x: point.x, y: point.y, z: point.z || 0 }));
+        }
+        return hand.map((point, pointIndex) => smoothPoint(previousHand?.[pointIndex], point, alpha));
+    });
+
+    stableHandedness = currentResolvedSides;
+    latestHandsRaw = currentHands.map(hand => hand.map(point => ({ x: point.x, y: point.y, z: point.z || 0 })));
+}
+
+function isFingerUp(hand, tipIndex, pipIndex) { return hand[tipIndex].y < (hand[pipIndex].y + FINGER_UP_TOLERANCE); }
+function isFingerCurled(hand, tipIndex, pipIndex) { return hand[tipIndex].y > (hand[pipIndex].y + FINGER_CURL_TOLERANCE); }
+
+function getPalmCenter(hand) {
+    return {
+        x: (hand[0].x + hand[5].x + hand[9].x + hand[13].x + hand[17].x) / 5,
+        y: (hand[0].y + hand[5].y + hand[9].y + hand[13].y + hand[17].y) / 5
+    };
+}
+
+function getPalmWidth(hand) {
+    return hypot(hand[5].x - hand[17].x, hand[5].y - hand[17].y);
+}
+
+function getAngleDeg(a, b, c) {
+    const bax = a.x - b.x;
+    const bay = a.y - b.y;
+    const baz = (a.z || 0) - (b.z || 0);
+    const bcx = c.x - b.x;
+    const bcy = c.y - b.y;
+    const bcz = (c.z || 0) - (b.z || 0);
+    const dot = bax * bcx + bay * bcy + baz * bcz;
+    const magBA = hypot(bax, bay, baz);
+    const magBC = hypot(bcx, bcy, bcz);
+    if (magBA < 1e-6 || magBC < 1e-6) return 0;
+    const cosTheta = clamp(dot / (magBA * magBC), -1, 1);
+    return acos(cosTheta) * (180 / Math.PI);
+}
+
+function isThumbUp(hand) {
+    const angle = getAngleDeg(hand[2], hand[3], hand[4]);
+    const openDistance = hypot(hand[4].x - hand[2].x, hand[4].y - hand[2].y);
+    const prevSegment = hypot(hand[3].x - hand[2].x, hand[3].y - hand[2].y);
+    const thumbToIndexMcp = hypot(hand[4].x - hand[5].x, hand[4].y - hand[5].y);
+    const palmCenter = getPalmCenter(hand);
+    const thumbToPalmCenter = hypot(hand[4].x - palmCenter.x, hand[4].y - palmCenter.y);
+    return angle >= THUMB_EXTENSION_ANGLE_DEG &&
+        openDistance >= THUMB_OPEN_DISTANCE_MIN &&
+        (openDistance - prevSegment) >= THUMB_SEGMENT_DELTA_MIN &&
+        thumbToIndexMcp >= THUMB_TO_INDEX_MCP_MIN &&
+        thumbToPalmCenter >= THUMB_TO_PALM_CENTER_MIN;
+}
+
+function isFistPose(hand) {
+    const palmCenter = getPalmCenter(hand);
+    const palmWidth = max(getPalmWidth(hand), 0.02);
+    const fingerToPalmMax = palmWidth * FIST_FINGER_TO_PALM_RATIO;
+    const thumbToPalmMax = palmWidth * FIST_THUMB_TO_PALM_RATIO;
+
+    const curledCount =
+        (isFingerCurled(hand, 8, 6) ? 1 : 0) +
+        (isFingerCurled(hand, 12, 10) ? 1 : 0) +
+        (isFingerCurled(hand, 16, 14) ? 1 : 0) +
+        (isFingerCurled(hand, 20, 18) ? 1 : 0);
+
+    const indexToPalm = getPointDistance(hand[8], palmCenter);
+    const middleToPalm = getPointDistance(hand[12], palmCenter);
+    const ringToPalm = getPointDistance(hand[16], palmCenter);
+    const pinkyToPalm = getPointDistance(hand[20], palmCenter);
+    const thumbToPalm = getPointDistance(hand[4], palmCenter);
+
+    const fingersNearPalm =
+        indexToPalm <= fingerToPalmMax &&
+        middleToPalm <= fingerToPalmMax &&
+        ringToPalm <= fingerToPalmMax &&
+        pinkyToPalm <= fingerToPalmMax;
+
+    const thumbFolded = thumbToPalm <= thumbToPalmMax || !isThumbUp(hand);
+
+    return curledCount >= FIST_CURL_MIN_FINGERS && fingersNearPalm && thumbFolded;
+}
+
+function isPinchPose(hand, distThreshold) {
+    const distPinch = hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y);
+    return distPinch < distThreshold;
+}
+
+function getAdaptivePinchThreshold(hand) {
+    const palmWidth = max(getPalmWidth(hand), 0.035);
+    return {
+        enter: clamp(palmWidth * 0.72, 0.055, PINCH_DISTANCE_THRESHOLD),
+        release: clamp(palmWidth * 0.95, 0.07, PINCH_RELEASE_DISTANCE_THRESHOLD),
+        strong: clamp(palmWidth * 0.58, 0.045, STRONG_PINCH_DISTANCE_THRESHOLD)
+    };
+}
+
+function countRaisedFingers(hand) {
+    let count = 0;
+    if (isThumbUp(hand)) count++;
+    if (isFingerUp(hand, 8, 6)) count++;
+    if (isFingerUp(hand, 12, 10)) count++;
+    if (isFingerUp(hand, 16, 14)) count++;
+    if (isFingerUp(hand, 20, 18)) count++;
+    return count;
+}
+
+function updateStableValue(rawValue, candidate, stableFrames, stableValue, requiredFrames) {
+    if (rawValue === candidate) stableFrames++;
+    else {
+        candidate = rawValue;
+        stableFrames = 1;
+    }
+    if (stableFrames >= requiredFrames) stableValue = candidate;
+    return { candidate, stableFrames, stableValue };
+}
+
+function detectGesture(hand) {
+    const middle = isFingerUp(hand, 12, 10);
+    const ring = isFingerUp(hand, 16, 14);
+    const pinky = isFingerUp(hand, 20, 18);
+    const count = countRaisedFingers(hand);
+    const distThumbIndex = hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y);
+    if (distThumbIndex < OK_GESTURE_DISTANCE_THRESHOLD && middle && ring && pinky) return "OK 👌";
+    if (count === 2) return "HI 👋";
+    if (count === 4) return "HELP 🆘";
+    return null;
+}
+
+function commitRotationToBoxes(cx, cy) {
+    const cosA = cos(rotationAngle);
+    const sinA = sin(rotationAngle);
+    const cosB = cos(rotationAngleY);
+    const sinB = sin(rotationAngleY);
+    boxes3D.forEach(b => {
+        let vx = b.gridX - cx;
+        let vy = b.gridY - cy;
+        let vz = b.z || 0;
+        let tx = vx * cosA - vz * sinA;
+        let tz = vx * sinA + vz * cosA;
+        vx = tx;
+        vz = tz;
+        let ty = vy * cosB - vz * sinB;
+        vz = vy * sinB + vz * cosB;
+        vy = ty;
+        b.gridX = vx + cx;
+        b.gridY = vy + cy;
+        b.z = vz;
+    });
+}
+
+function getDistance(p1, p2) {
+    const dx = p1.x - p2.x;
+    const dy = p1.y - p2.y;
+    return sqrt(dx * dx + dy * dy);
+}
+
+function calculateEAR(eyeIdx, face) {
+    const p1 = face[eyeIdx[0]], p2 = face[eyeIdx[1]], p3 = face[eyeIdx[2]], p4 = face[eyeIdx[3]], p5 = face[eyeIdx[4]], p6 = face[eyeIdx[5]];
+    const v1 = getDistance(p2, p6);
+    const v2 = getDistance(p3, p5);
+    const h = getDistance(p1, p4);
+    return h > 0 ? (v1 + v2) / (2.0 * h) : 0;
+}
+
+function scheduleDraw() {
+    if (typeof video.requestVideoFrameCallback === "function") {
+        video.requestVideoFrameCallback(() => {
+            const now = performance.now();
+            if ((now - lastRenderAt) >= PERF.renderIntervalMs) {
+                lastRenderAt = now;
+                drawScene();
+            }
+            scheduleDraw();
+        });
+    } else {
+        requestAnimationFrame(() => {
+            const now = performance.now();
+            if ((now - lastRenderAt) >= PERF.renderIntervalMs) {
+                lastRenderAt = now;
+                drawScene();
+            }
+            scheduleDraw();
+        });
+    }
+}
+
+async function startCamera() {
+    try {
+        const videoConstraints = isMobile
+            ? { facingMode: { ideal: "user" }, width: { ideal: 640, max: 720 }, height: { ideal: 360, max: 480 } }
+            : { facingMode: "user", width: { ideal: 960, max: 1280 }, height: { ideal: 540, max: 720 } };
+        const stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
+        video.srcObject = stream; await video.play(); scheduleDraw(); detectLoop();
+    } catch (err) { info.innerText = "Không mở được camera: " + err.message; }
+}
+
+function drawScene() {
+    if (video.readyState < 2) return;
+    const rect = getDrawRect();
+    const uiScale = getUiScale();
+    const baseLabelFont = round(16 * uiScale);
+    const gestureFont = round(26 * uiScale);
+    const statusFont = round(26 * uiScale);
+    const strokeThin = clamp(1.5 * uiScale, 1.1, 1.5);
+    const safeMargin = round(clamp(canvas.width * 0.02, 12, 24));
+    const now = performance.now();
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+
+    if (lastHandsResultAt > 0 && (now - lastHandsResultAt) > PERF.detectorStaleMs && (smoothedHands.length > 0 || latestHandsRaw.length > 0)) {
+        resetHandTrackingState(cx, cy, true);
+    }
+    if (lastFaceResultAt > 0 && (now - lastFaceResultAt) > PERF.detectorStaleMs && (latestFaceResult || lastFaceLandmarks)) {
+        resetFaceTrackingState();
+    }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.translate(rect.offsetX + rect.drawWidth, rect.offsetY);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, rect.drawWidth, rect.drawHeight);
+    ctx.restore();
+
+    let faceFound = false;
+    const face = (now - lastFaceSeenAt) <= PERF.faceHoldMs ? (smoothedFaceLandmarks || lastFaceLandmarks) : null;
+    if (face) {
+        faceFound = true;
+        const avgEARRaw = (calculateEAR([33, 160, 158, 133, 153, 144], face) + calculateEAR([362, 385, 387, 263, 373, 380], face)) / 2.0;
+        if (Number.isFinite(avgEARRaw) && avgEARRaw > 0) {
+            latestEAR = avgEARRaw;
+            smoothedEAR = smoothedEAR === null ? avgEARRaw : (smoothedEAR * (1 - EAR_SMOOTHING_ALPHA) + avgEARRaw * EAR_SMOOTHING_ALPHA);
+
+            const isCurrentClosed = smoothedEAR < EYE_CLOSED_THRESHOLD;
+            if (isCurrentClosed) {
+                if (eyeClosedSince === null) eyeClosedSince = now;
+                eyeOpenSince = null;
+                if (!isSleeping && (now - eyeClosedSince) >= EYE_CLOSED_DURATION_MS) {
+                    isSleeping = true;
+                }
+            } else {
+                eyeClosedSince = null;
+                if (isSleeping) {
+                    if (eyeOpenSince === null) eyeOpenSince = now;
+                    if ((now - eyeOpenSince) >= EYE_OPEN_CONFIRM_MS) {
+                        isSleeping = false;
+                        eyeOpenSince = null;
+                    }
+                } else {
+                    eyeOpenSince = null;
+                }
+            }
+            if (isSleeping) {
+                faceStatus = "BUỒN NGỦ!";
+            } else if (isCurrentClosed) {
+                faceStatus = "Đang nhắm mắt...";
+            } else {
+                faceStatus = "Tỉnh táo";
+            }
+        } else {
+            latestEAR = null;
+            eyeClosedSince = null;
+            if (isSleeping) {
+                if (eyeOpenSince === null) eyeOpenSince = now;
+                if ((now - eyeOpenSince) >= EYE_OPEN_CONFIRM_MS) {
+                    isSleeping = false;
+                    faceStatus = "Đang nhắm mắt...";
+                } else faceStatus = "BUỒN NGỦ!";
+            } else {
+                eyeOpenSince = null;
+                faceStatus = "Đang nhắm mắt...";
+            }
+        }
+    } else {
+        latestEAR = null;
+        eyeClosedSince = null;
+        if (isSleeping) {
+            if (eyeOpenSince === null) eyeOpenSince = now;
+            if ((now - eyeOpenSince) >= EYE_OPEN_CONFIRM_MS) {
+                isSleeping = false;
+                faceStatus = "Đang theo dõi mặt...";
+            } else faceStatus = "BUỒN NGỦ!";
+        } else {
+            eyeOpenSince = null;
+            faceStatus = "Đang theo dõi mặt...";
+        }
+    }
+
+    if (isSleeping) {
+        if (!alarmInterval) {
+            playBeep();
+            alarmInterval = setInterval(playBeep, 400);
+        }
+    } else if (alarmInterval) {
+        clearInterval(alarmInterval);
+        alarmInterval = null;
+    }
+
+    facesToDraw.length = 0;
+    const cosX = cos(rotationAngle);
+    const sinX = sin(rotationAngle);
+    const cosY = cos(rotationAngleY);
+    const sinY = sin(rotationAngleY);
+
+    if (boxes3D.length > 0) {
+        boxes3D.forEach(box => {
+            const projected = BOX_VERTICES.map(v => {
+                let vx = (v.x * BOX_SIZE / 2) + (box.gridX - cx);
+                let vy = (v.y * BOX_SIZE / 2) + (box.gridY - cy);
+                let vz = (v.z * BOX_SIZE / 2) + box.z;
+                const tx = vx * cosX - vz * sinX;
+                const tz = vx * sinX + vz * cosX;
+                vx = tx;
+                vz = tz;
+                const ty = vy * cosY - vz * sinY;
+                vz = vy * sinY + vz * cosY;
+                vy = ty;
+                return { x: vx + cx, y: vy + cy, z: vz };
+            });
+
+            BOX_FACES.forEach((faceDef, faceIndex) => {
+                const p0 = projected[faceDef.i[0]];
+                const p1 = projected[faceDef.i[1]];
+                const p2 = projected[faceDef.i[2]];
+                const p3 = projected[faceDef.i[3]];
+                facesToDraw.push({
+                    z: (p0.z + p1.z + p2.z + p3.z) / 4,
+                    pts: [p0, p1, p2, p3],
+                    sourceBox: box,
+                    faceIndex,
+                    color: faceDef.c,
+                    centerX: (p0.x + p1.x + p2.x + p3.x) / 4,
+                    centerY: (p0.y + p1.y + p2.y + p3.y) / 4,
+                    minX: Math.min(p0.x, p1.x, p2.x, p3.x),
+                    maxX: Math.max(p0.x, p1.x, p2.x, p3.x),
+                    minY: Math.min(p0.y, p1.y, p2.y, p3.y),
+                    maxY: Math.max(p0.y, p1.y, p2.y, p3.y)
+                });
+            });
+        });
+    }
+
+    // Xử lý tay 
+    const mappedSmoothedHands = smoothedHands.length > 0
+        ? smoothedHands.map(hand => hand.map(pt => mapPoint(pt, rect)))
+        : [];
+    if (smoothedHands.length > 0) {
+            let rightSeen = false;
+            let leftSeen = false;
+            smoothedHands.forEach((hand, handIdx) => {
+                const label = stableHandedness[handIdx]?.label || "Unknown";
+                const fingersUp = countRaisedFingers(hand);
+                const mappedPoints = mappedSmoothedHands[handIdx];
+                const wrist = mappedPoints[0];
+                const labelOffsetX = Math.round(15 * uiScale);
+                const labelOffsetY = Math.round(15 * uiScale);
+
+                ctx.fillStyle = "#ffffff"; ctx.font = `bold ${baseLabelFont}px sans-serif`;
+                ctx.fillText(`Tay ${handIdx + 1} (${label}) | ${fingersUp} ngón`, wrist.x + labelOffsetX, wrist.y - labelOffsetY);
+
+                if (label === "Trái") {
+                    leftSeen = true;
+                    leftHandLastSeenAt = now;
+                    if (leftFingerCandidate === fingersUp) leftFingerStableFrames++;
+                    else {
+                        leftFingerCandidate = fingersUp;
+                        leftFingerStableFrames = 1;
+                    }
+                    if (leftFingerStableFrames >= LEFT_ACTION_STABLE_FRAMES) {
+                        leftFingerStable = leftFingerCandidate;
+                    }
+                    if (leftFingerStable === 5 && (now - lastLeftClearAt) > LEFT_CLEAR_COOLDOWN_MS) {
+                        boxes3D = [];
+                        lastLeftClearAt = now;
+                    }
+                    if (leftFingerStable === 1) lightOn = true;
+                    else if (leftFingerStable === 0) lightOn = false;
+                    const gst = detectGesture(hand);
+                    const leftGestureState = updateStableValue(
+                        gst,
+                        leftGestureCandidate,
+                        leftGestureStableFrames,
+                        leftGestureStable,
+                        GESTURE_STABLE_FRAMES
+                    );
+                    leftGestureCandidate = leftGestureState.candidate;
+                    leftGestureStableFrames = leftGestureState.stableFrames;
+                    leftGestureStable = leftGestureState.stableValue;
+                    if (leftGestureStable) leftGestureLastSeenAt = now;
+                    if (leftGestureStable && (now - leftGestureLastSeenAt) <= GESTURE_HOLD_MS) {
+                        ctx.fillStyle = "#FFD700";
+                        ctx.font = `bold ${gestureFont}px sans-serif`;
+                        ctx.fillText(leftGestureStable, wrist.x + labelOffsetX, wrist.y - Math.round(40 * uiScale));
+                    }
+                }
+
+                if (label === "Phải") {
+                    rightSeen = true;
+                    const distPinch = hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y);
+                    const fistPose = isFistPose(hand);
+                    const indexCurled = isFingerCurled(hand, 8, 6);
+                    const pinchThreshold = getAdaptivePinchThreshold(hand);
+                    if (fistPose) {
+                        pinchActive = false;
+                        lastPinchPoint = null;
+                        if (rightMode === "pinch") {
+                            rightMode = "idle";
+                            rightModeCandidate = "idle";
+                            rightModeCandidateFrames = RIGHT_MODE_STABLE_FRAMES;
+                            wasZeroFingers = false;
+                        }
+                    }
+                    const pinchStrong = isPinchPose(hand, pinchThreshold.strong) && !fistPose;
+                    const pinchCandidate = isPinchPose(hand, pinchThreshold.enter) && !fistPose;
+                    const pinchStillHeld = pinchActive && isPinchPose(hand, pinchThreshold.release) && !fistPose;
+                    const rotatePose = fistPose || fingersUp <= 2 || ((fingersUp === 0) && indexCurled && distPinch > ROTATE_ENTRY_PINCH_DISTANCE);
+                    let desiredMode = "idle";
+                    if (pinchStrong || (pinchActive && pinchStillHeld)) desiredMode = "pinch";
+                    else if (rotatePose) desiredMode = "rotate";
+                    else if (pinchCandidate) desiredMode = "pinch";
+
+                    if (desiredMode === rightModeCandidate) rightModeCandidateFrames++;
+                    else {
+                        rightModeCandidate = desiredMode;
+                        rightModeCandidateFrames = 1;
+                    }
+
+                    if (rightModeCandidateFrames >= RIGHT_MODE_STABLE_FRAMES && rightMode !== rightModeCandidate) {
+                        if (rightMode === "rotate" && wasZeroFingers) {
+                            commitRotationToBoxes(cx, cy);
+                            rotationAngle = 0;
+                            rotationAngleY = 0;
+                            wasZeroFingers = false;
+                        }
+                        rightMode = rightModeCandidate;
+                        if (rightMode === "rotate") {
+                            lastHandX = hand[0].x;
+                            lastHandY = hand[0].y;
+                            wasZeroFingers = true;
+                            pinchActive = false;
+                            lastPinchPoint = null;
+                        } else if (rightMode === "pinch") {
+                            pinchActive = true;
+                            wasZeroFingers = false;
+                        } else {
+                            pinchActive = false;
+                            wasZeroFingers = false;
+                            lastPinchPoint = null;
+                        }
+                    }
+
+                    if (rightMode === "rotate") {
+                        const dx = hand[0].x - lastHandX;
+                        const dy = hand[0].y - lastHandY;
+                        if (Math.abs(dx) > ROTATE_DEADZONE) rotationAngle += dx * ROTATION_SENSITIVITY;
+                        if (Math.abs(dy) > ROTATE_DEADZONE) rotationAngleY += dy * ROTATION_SENSITIVITY;
+                        lastHandX = hand[0].x;
+                        lastHandY = hand[0].y;
+                    }
+
+                    if (rightMode !== "pinch") {
+                        pinchActive = false;
+                    }
+
+                    const pinchPointNorm = { x: (hand[4].x + hand[8].x) / 2, y: (hand[4].y + hand[8].y) / 2 };
+                    const movedEnough = !lastPinchPoint || hypot(
+                        pinchPointNorm.x - lastPinchPoint.x,
+                        pinchPointNorm.y - lastPinchPoint.y
+                    ) >= PINCH_MOVE_MIN;
+
+                    if (pinchActive && movedEnough && performance.now() - lastPinchHitTestAt >= PERF.pinchHitTestMs) {
+                        lastPinchHitTestAt = performance.now();
+                        const mx = (mappedPoints[4].x + mappedPoints[8].x) / 2, my = (mappedPoints[4].y + mappedPoints[8].y) / 2;
+                        let hit = null;
+                        let hitZ = -Infinity;
+                        const hitPadding = round(clamp(18 * uiScale, 12, 24));
+                        for (let i = 0; i < facesToDraw.length; i++) {
+                            const f = facesToDraw[i];
+                            if (mx < (f.minX - hitPadding) || mx > (f.maxX + hitPadding) || my < (f.minY - hitPadding) || my > (f.maxY + hitPadding)) continue;
+                            if (isPointInQuad(mx, my, f.pts) && f.z > hitZ) {
+                                hit = f;
+                                hitZ = f.z;
+                            }
+                        }
+                        if (!hit && facesToDraw.length > 0) {
+                            let best = null;
+                            let bestDist = Infinity;
+                            for (let i = 0; i < facesToDraw.length; i++) {
+                                const f = facesToDraw[i];
+                                const dx = f.centerX - mx;
+                                const dy = f.centerY - my;
+                                const d = dx * dx + dy * dy;
+                                if (d < bestDist) {
+                                    bestDist = d;
+                                    best = f;
+                                }
+                            }
+                            const maxFallbackDist = (BOX_SIZE * 2.1) * (BOX_SIZE * 2.1);
+                            if (best && bestDist <= maxFallbackDist) hit = best;
+                        }
+                        if (performance.now() - lastBoxTime > BOX_ADD_COOLDOWN_MS) {
+                            if (hit) {
+                                const normal = FACE_NORMALS[hit.faceIndex] || { x: 0, y: 0, z: 1 };
+                                const nextX = hit.sourceBox.gridX + normal.x * BOX_SIZE;
+                                const nextY = hit.sourceBox.gridY + normal.y * BOX_SIZE;
+                                const nextZ = (hit.sourceBox.z || 0) + normal.z * BOX_SIZE;
+                                if (addBoxAt(nextX, nextY, nextZ)) {
+                                    lastPinchPoint = pinchPointNorm;
+                                }
+                            } else if (boxes3D.length === 0) {
+                                const gx = Math.round(mx / BOX_SIZE) * BOX_SIZE;
+                                const gy = Math.round(my / BOX_SIZE) * BOX_SIZE;
+                                if (addBoxAt(gx, gy, 0)) {
+                                    lastPinchPoint = pinchPointNorm;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            if (!rightSeen) {
+                resetRightInteraction(cx, cy, true);
+            }
+            if (!leftSeen && leftHandLastSeenAt > 0 && (now - leftHandLastSeenAt) > LEFT_HAND_LOST_RESET_MS) {
+                leftFingerCandidate = null;
+                leftFingerStableFrames = 0;
+                leftFingerStable = null;
+                leftGestureCandidate = null;
+                leftGestureStableFrames = 0;
+                leftGestureStable = null;
+                leftGestureLastSeenAt = 0;
+                leftHandLastSeenAt = 0;
+            }
+    }
+
+    // Render khối 3D
+    if (facesToDraw.length > 0) {
+        facesToDraw.sort((a, b) => a.z - b.z);
+        facesToDraw.forEach(f => {
+            ctx.fillStyle = f.color;
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
+            ctx.lineWidth = strokeThin;
+            ctx.beginPath();
+            ctx.moveTo(f.pts[0].x, f.pts[0].y);
+            ctx.lineTo(f.pts[1].x, f.pts[1].y);
+            ctx.lineTo(f.pts[2].x, f.pts[2].y);
+            ctx.lineTo(f.pts[3].x, f.pts[3].y);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+        });
+    }
+
+    if (lightOn) {
+        if (!cachedGlowGradient || cachedGlowWidth !== canvas.width || cachedGlowHeight !== canvas.height) {
+            cachedGlowGradient = ctx.createRadialGradient(
+                cx,
+                cy,
+                Math.round(clamp(40 * uiScale, 24, 40)),
+                cx,
+                cy,
+                Math.max(canvas.width, canvas.height) / 1.3
+            );
+            cachedGlowGradient.addColorStop(0, "rgba(48, 224, 189, 0.3)");
+            cachedGlowGradient.addColorStop(1, "rgba(255,220,80,0)");
+            cachedGlowWidth = canvas.width;
+            cachedGlowHeight = canvas.height;
+        }
+        ctx.fillStyle = cachedGlowGradient;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    // Overlay luôn nằm trên cùng để dễ nhìn
+    if (face) {
+        const mappedFaceOval = FACE_OVAL_INDICES.map(faceIndex => mapPoint(face[faceIndex], rect));
+        const first = mappedFaceOval[0];
+        if (first) {
+            ctx.strokeStyle = "rgba(175, 255, 250, 0.95)";
+            ctx.lineWidth = max(1.3, strokeThin);
+            ctx.beginPath();
+            ctx.moveTo(first.x, first.y);
+            for (let i = 1; i < mappedFaceOval.length; i++) {
+                const p = mappedFaceOval[i];
+                if (p) ctx.lineTo(p.x, p.y);
+            }
+            ctx.closePath();
+            ctx.stroke();
+        }
+    }
+
+    const handsForOverlay = latestHandsRaw.length > 0 ? latestHandsRaw : smoothedHands;
+    const mappedOverlayHands = handsForOverlay === smoothedHands
+        ? mappedSmoothedHands
+        : handsForOverlay.map(hand => hand.map(pt => mapPoint(pt, rect)));
+    if (handsForOverlay.length > 0) {
+        const jointIndices = isMobile ? MOBILE_JOINT_INDICES : ALL_JOINT_INDICES;
+        handsForOverlay.forEach((_, handIdx) => {
+            const mappedPoints = mappedOverlayHands[handIdx];
+            ctx.strokeStyle = "rgb(255, 0, 0)";
+            ctx.lineWidth = max(1.1, strokeThin);
+            for (let i = 0; i < HAND_CONNECTIONS.length; i++) {
+                const [a, b] = HAND_CONNECTIONS[i];
+                const p1 = mappedPoints[a];
+                const p2 = mappedPoints[b];
+                if (!p1 || !p2) continue;
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.stroke();
+            }
+            ctx.fillStyle = "rgb(255, 255, 255)";
+            const jointRadius = max(1.8, 2.8 * uiScale);
+            const pointsToDraw = jointIndices;
+            for (let i = 0; i < pointsToDraw.length; i++) {
+                const p = mappedPoints[pointsToDraw[i]];
+                if (!p) continue;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, jointRadius, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        });
+    }
+
+    ctx.fillStyle = isSleeping ? "#ff3333" : (faceFound ? "#00ffcc" : "#aaaaaa");
+    ctx.font = `bold ${statusFont}px sans-serif`;
+    ctx.fillText(`Trạng thái: ${faceStatus}`, safeMargin, safeMargin + statusFont);
+
+    if (isSleeping) {
+        ctx.fillStyle = "rgba(255, 0, 0, 0.35)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#ffffff";
+        let warningFont = Math.round(clamp(canvas.width * 0.08, 24, 55));
+        const warningText = "⚠️ CẢNH BÁO BUỒN NGỦ ⚠️";
+        ctx.font = `bold ${warningFont}px sans-serif`;
+        while (ctx.measureText(warningText).width > canvas.width - safeMargin * 2 && warningFont > 18) {
+            warningFont -= 2;
+            ctx.font = `bold ${warningFont}px sans-serif`;
+        }
+        ctx.textAlign = "center";
+        ctx.fillText(warningText, cx, cy);
+        ctx.textAlign = "left";
+    }
+
+    const frameNow = performance.now();
+    const frameDeltaMs = max(frameNow - lastTime, 1);
+    const instantFps = 1000 / frameDeltaMs;
+    renderFps = renderFps === 0 ? instantFps : (renderFps * 0.85 + instantFps * 0.15);
+    lastTime = frameNow;
+    if (frameNow - lastInfoUpdateAt >= PERF.infoRefreshMs) {
+        const earDisplay = latestEAR !== null ? latestEAR.toFixed(3) : "---";
+        info.innerText = `FPS: ${renderFps.toFixed(1)} | Tay: ${smoothedHands.length} | Mặt: ${faceStatus} | EAR: ${earDisplay}`;
+        lastInfoUpdateAt = frameNow;
+    }
+}
+
+async function detectLoop() {
+    const now = performance.now();
+    if (
+        video.readyState >= 2 &&
+        hands &&
+        faceMesh &&
+        !detectBusy &&
+        !detectorRestarting &&
+        (now - lastDetectAt) >= PERF.detectIntervalMs
+    ) {
+        detectBusy = true;
+        lastDetectAt = now;
+        try {
+            await withTimeout(hands.send({ image: video }), PERF.detectCallTimeoutMs, "hands");
+            if (detectPhase === 0) {
+                await withTimeout(faceMesh.send({ image: video }), PERF.detectCallTimeoutMs, "faceMesh");
+            }
+            detectPhase = (detectPhase + 1) % PERF.faceDetectEveryNthLoop;
+        }
+        catch(e) {
+            console.error(e);
+            await restartDetectors(e?.message || "detectLoop error");
+        }
+        finally { detectBusy = false; }
+    }
+    const elapsed = performance.now() - now;
+    const waitMs = video.readyState >= 2 ? max(12, PERF.detectIntervalMs - elapsed) : 40;
+    setTimeout(detectLoop, waitMs);
+}
+initDetectors();
+startCamera();
